@@ -254,6 +254,10 @@ class CoreService:
         items, _ = await self._http.get_page("/api/v1/organizations")
         return items
 
+    async def list_roles(self) -> list[dict]:
+        items, _ = await self._http.get_page("/api/v1/roles")
+        return items
+
 
 class TmService:
     """Projects / issues / tasks (cws-work via BFF)."""
@@ -271,8 +275,37 @@ class TmService:
             body["description"] = description
         return await self._http.post("/api/v1/projects", json=body)
 
+    async def get_project(self, project_id: str) -> dict:
+        return await self._http.get(f"/api/v1/projects/{project_id}")
+
+    async def update_project(self, project_id: str, body: dict) -> dict:
+        return await self._http.request("PATCH", f"/api/v1/projects/{project_id}", json=body)
+
+    async def archive_project(self, project_id: str) -> dict:
+        return await self._http.post(f"/api/v1/projects/{project_id}/archive")
+
+    async def restore_project(self, project_id: str) -> dict:
+        return await self._http.post(f"/api/v1/projects/{project_id}/restore")
+
+    async def list_project_members(self, project_id: str) -> list[dict]:
+        items, _ = await self._http.get_page(f"/api/v1/projects/{project_id}/members")
+        return items
+
+    async def add_project_member(self, project_id: str, member_id: str) -> dict:
+        return await self._http.post(
+            f"/api/v1/projects/{project_id}/members", json={"member_id": member_id}
+        )
+
+    async def remove_project_member(self, project_id: str, member_id: str) -> None:
+        await self._http.request(
+            "DELETE", f"/api/v1/projects/{project_id}/members/{member_id}"
+        )
+
     async def get_task(self, task_id: str) -> dict:
         return await self._http.get(f"/api/v1/tasks/{task_id}")
+
+    async def get_event_binding(self, event_binding_id: str) -> dict:
+        return await self._http.get(f"/api/v1/event-bindings/{event_binding_id}")
 
     async def list_issues(self, project_id: Optional[str] = None, limit: int = 50) -> list[dict]:
         path = f"/api/v1/projects/{project_id}/issues" if project_id else "/api/v1/issues"
@@ -412,6 +445,33 @@ class KbService:
     async def list_kbs(self, limit: int = 50) -> list[dict]:
         items, _ = await self._http.get_page("/api/v1/kbs", params={"limit": limit})
         return items
+
+    async def create_kb(self, body: dict) -> dict:
+        return await self._http.post("/api/v1/kbs", json=body)
+
+    async def update_page(self, page_id: str, body: dict) -> dict:
+        """PATCH page metadata (title/parent/etc.)."""
+        return await self._http.request("PATCH", f"/api/v1/pages/{page_id}", json=body)
+
+    async def delete_page_permanently(self, page_id: str) -> None:
+        await self._http.request("DELETE", f"/api/v1/pages/{page_id}")
+
+    async def list_page_references(self, page_id: str) -> list[dict]:
+        items, _ = await self._http.get_page(f"/api/v1/pages/{page_id}/references")
+        return items
+
+    async def create_file_node(self, kb_id: str, name: str, artifact_id: str, parent_id: str = "") -> dict:
+        body: dict[str, Any] = {"name": name, "artifact_id": artifact_id}
+        if parent_id:
+            body["parent_id"] = parent_id
+        return await self._http.post(f"/api/v1/kbs/{kb_id}/tree/files", json=body)
+
+    async def batch_download(self, kb_id: str, node_ids: list[str]) -> list[dict]:
+        data = await self._http.post(
+            f"/api/v1/kbs/{kb_id}/tree/files/batch-download",
+            json={"node_ids": node_ids, "inline": False},
+        )
+        return data if isinstance(data, list) else data.get("items", [])
 
     async def search_pages(self, query: str, *, kb_id: Optional[str] = None, limit: int = 20) -> list[dict]:
         params: dict[str, Any] = {"query": query, "limit": limit}

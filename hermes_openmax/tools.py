@@ -52,7 +52,10 @@ TASKS_SCHEMA = {
     "description": (
         "Operate OpenMax workspace projects/issues/tasks (cws-work). Actions: "
         "list_projects, project_create(body{name,lead_member_id,description?}), "
-        "task_get(task_id), list_issues(project_id?), get_issue(issue_id), "
+        "project_get/project_update(body)/project_archive/project_restore(project_id), "
+        "project_members(project_id), project_member_add/remove(project_id, member_id), "
+        "task_get(task_id), blueprint_set_steps(blueprint_id, body{steps}), "
+        "binding_get(binding_id), list_issues(project_id?), get_issue(issue_id), "
         "create_issue(project_id, body{title,owner_member_id,...}), "
         "update_issue(issue_id, body), "
         "issue_action(issue_id, name=activate|submit-plan|accept-plan|deliver|resume|terminate|accept-delivered, body?), "
@@ -85,6 +88,7 @@ TASKS_SCHEMA = {
             "reason": {"type": "string"},
             "query": {"type": "string"},
             "name": {"type": "string", "description": "sub-action name for issue_action/task_action"},
+            "member_id": {"type": "string"},
             "body": {"type": "object"},
             "limit": {"type": "integer"},
         },
@@ -107,8 +111,27 @@ def handle_tasks(args: dict, **kw: Any) -> str:
                 body.get("lead_member_id", ""),
                 description=body.get("description", ""),
             )
+        if a == "project_get":
+            return await tm.get_project(args["project_id"])
+        if a == "project_update":
+            return await tm.update_project(args["project_id"], body)
+        if a == "project_archive":
+            return await tm.archive_project(args["project_id"])
+        if a == "project_restore":
+            return await tm.restore_project(args["project_id"])
+        if a == "project_members":
+            return await tm.list_project_members(args["project_id"])
+        if a == "project_member_add":
+            return await tm.add_project_member(args["project_id"], args["member_id"])
+        if a == "project_member_remove":
+            await tm.remove_project_member(args["project_id"], args["member_id"])
+            return {"ok": True}
         if a == "task_get":
             return await tm.get_task(args["task_id"])
+        if a == "blueprint_set_steps":
+            return await tm.set_blueprint_steps(args["blueprint_id"], body.get("steps") or [])
+        if a == "binding_get":
+            return await tm.get_event_binding(args["binding_id"])
         if a == "list_issues":
             return await tm.list_issues(args.get("project_id"), limit=limit)
         if a == "get_issue":
@@ -178,7 +201,10 @@ KB_SCHEMA = {
         "revision_restore(page_id, revision_id), trash(page_id), restore(page_id), "
         "trashed, create_folder(kb_id, name, parent_id?), rename_node(kb_id, node_id, name), "
         "move_node(kb_id, node_id, parent_id?), delete_node(kb_id, node_id), "
-        "download_node(kb_id, node_id) -> presigned URL"
+        "download_node(kb_id, node_id) -> presigned URL, kb_create(body{name}), "
+        "page_update(page_id, body), page_delete(page_id, PERMANENT), freeze(page_id), "
+        "references(page_id), create_file(kb_id, name, artifact_id, parent_id?), "
+        "batch_download(kb_id, node_ids[])"
     ),
     "parameters": {
         "type": "object",
@@ -192,6 +218,8 @@ KB_SCHEMA = {
             "revision_id": {"type": "integer"},
             "from_rev": {"type": "integer"},
             "to_rev": {"type": "integer"},
+            "artifact_id": {"type": "string"},
+            "node_ids": {"type": "array", "items": {"type": "string"}},
             "query": {"type": "string"},
             "body": {"type": "object"},
             "limit": {"type": "integer"},
@@ -245,6 +273,23 @@ def handle_kb(args: dict, **kw: Any) -> str:
             return {"ok": True}
         if a == "download_node":
             return await kb.download_node(args["kb_id"], args["node_id"])
+        if a == "kb_create":
+            return await kb.create_kb(args.get("body") or {"name": args.get("name", "")})
+        if a == "page_update":
+            return await kb.update_page(args["page_id"], args.get("body") or {})
+        if a == "page_delete":
+            await kb.delete_page_permanently(args["page_id"])
+            return {"ok": True, "warning": "permanently deleted"}
+        if a == "freeze":
+            return await kb.freeze_page(args["page_id"])
+        if a == "references":
+            return await kb.list_page_references(args["page_id"])
+        if a == "create_file":
+            return await kb.create_file_node(
+                args["kb_id"], args["name"], args["artifact_id"], args.get("parent_id", "")
+            )
+        if a == "batch_download":
+            return await kb.batch_download(args["kb_id"], list(args.get("node_ids") or []))
         return {"error": f"unknown action {a!r}"}
 
     return _run(go)
@@ -258,7 +303,8 @@ MEMBERS_SCHEMA = {
         "OpenMax workspace directory. Actions: me, list(kind=human|agent, search?), "
         "get(member_id), create_dm(peer_member_id), "
         "agent_profiles(project_id?) -> capability profiles (skills/tags/online) — "
-        "MUST consult before assigning work to agents, rename(name)"
+        "MUST consult before assigning work to agents, rename(name), orgs, roles, "
+        "frontend_url(path e.g. 'projects?project=X') -> clickable workspace link"
     ),
     "parameters": {
         "type": "object",
@@ -268,6 +314,9 @@ MEMBERS_SCHEMA = {
             "peer_member_id": {"type": "string"},
             "kind": {"type": "string"},
             "search": {"type": "string"},
+            "name": {"type": "string"},
+            "project_id": {"type": "string"},
+            "path": {"type": "string"},
         },
         "required": ["action"],
     },
@@ -286,6 +335,16 @@ def handle_members(args: dict, **kw: Any) -> str:
             return await core.get_member(args["member_id"])
         if a == "create_dm":
             return await comm.create_dm(args["peer_member_id"])
+        if a == "orgs":
+            return await core.list_organizations()
+        if a == "roles":
+            return await core.list_roles()
+        if a == "frontend_url":
+            import os
+
+            base = os.getenv("CWS_BFF_URL", "").rstrip("/")
+            path = args.get("path", "").lstrip("/")
+            return {"url": f"{base}/workspace/{path}"}
         if a == "agent_profiles":
             project_id = args.get("project_id", "")
             if not project_id and not args.get("member_id"):

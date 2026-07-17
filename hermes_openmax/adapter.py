@@ -40,10 +40,15 @@ def _policy_from_env() -> AccessPolicyConfig:
     allow = [s.strip() for s in os.getenv("CWS_ALLOWED_USERS", "").split(",") if s.strip()]
     dm_policy = os.getenv("CWS_DM_POLICY", "").strip().lower()
     if dm_policy not in ("open", "allowlist", "owner"):
-        # Default open: CWS already scopes access to org members. Note this is
-        # intentionally looser than zylos's owner-private default — the
-        # platform can tighten it live via agent.config.dm_policy_changed.
-        dm_policy = "open" if flag("CWS_ALLOW_ALL_USERS", True) else "allowlist"
+        # Resolution order mirrors zylos: explicit allow-all -> open;
+        # explicit allowlist -> allowlist; otherwise the zylos default —
+        # owner-private (first human DM auto-binds the owner, see bridge).
+        if flag("CWS_ALLOW_ALL_USERS", False):
+            dm_policy = "open"
+        elif allow:
+            dm_policy = "allowlist"
+        else:
+            dm_policy = "owner"
     return AccessPolicyConfig(
         dm_policy=dm_policy,
         group_require_mention=flag("CWS_GROUP_REQUIRE_MENTION", True),

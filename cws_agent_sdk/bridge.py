@@ -100,7 +100,6 @@ class CwsBridge:
         self._metrics_interval_s = metrics_interval_s
         self._metrics_task: Optional[asyncio.Task] = None
         self._on_config_event = on_config_event
-        self.owner_member_id: str = ""
         self._ack_reaction = ack_reaction
         self._ack_ttl_s = ack_reaction_ttl_s
         self._pending_acks: dict[str, str] = {}  # conv_id -> message_id with our ack on it
@@ -114,6 +113,7 @@ class CwsBridge:
         )
         self._policy = policy or AccessPolicyConfig()
         self._group_mode_overrides: dict[str, str] = {}  # conv_id -> raw mode
+        self.owner_member_id: str = ""
         self._load_policy_state()
         self._seen: "OrderedDict[str, None]" = OrderedDict(
             (k, None) for k in (storage.read_json(_DEDUP_KEY) or [])[-_DEDUP_MAX:]
@@ -164,7 +164,11 @@ class CwsBridge:
                     self._cfg.org_id = str(me.get("org_id") or "")
             if self._cfg.member_id:
                 member = await self.core.get_member(self._cfg.member_id)
-                self.owner_member_id = str(member.get("owner_member_id") or "")
+                platform_owner = str(member.get("owner_member_id") or "")
+                if platform_owner:
+                    # Platform data is authoritative; keep a first-DM-bound
+                    # owner only while the platform has none.
+                    self.owner_member_id = platform_owner
         except CwsApiError as exc:
             self._log.warn("identity/owner resolve failed (non-fatal):", exc)
 
@@ -370,6 +374,19 @@ class CwsBridge:
                 self._mark_seen(key)
                 await self._advance(conversation_id, msg.seq or seq)
                 return
+            # zylos parity: dm_policy=owner with no owner bound — the first
+            # human DM sender becomes the owner (persisted; platform data
+            # overrides on next identity resolve if it disagrees).
+            if (
+                not is_group
+                and msg.sender_type == "human"
+                and not self.owner_member_id
+                and (self._policy.dm_policy or "").lower() == "owner"
+                and msg.sender_id
+            ):
+                self.owner_member_id = msg.sender_id
+                self._save_policy_state()
+                self._log.log("owner auto-bound to first DM sender:", msg.sender_id)
             await self._hydrate_media(msg)
             await self._expand_work_references(msg)
             await self._hydrate_reply_context(msg)
@@ -728,6 +745,8 @@ class CwsBridge:
             return
         if saved.get("dm_policy"):
             self._policy.dm_policy = str(saved["dm_policy"])
+        if saved.get("owner_member_id"):
+            self.owner_member_id = str(saved["owner_member_id"])
         if isinstance(saved.get("dm_allowlist"), list):
             self._policy.dm_allowlist = [str(i) for i in saved["dm_allowlist"]]
         if isinstance(saved.get("group_modes"), dict):
@@ -742,6 +761,7 @@ class CwsBridge:
                 "dm_policy": self._policy.dm_policy,
                 "dm_allowlist": self._policy.dm_allowlist,
                 "group_modes": self._group_mode_overrides,
+                "owner_member_id": self.owner_member_id,
             },
         )
 
