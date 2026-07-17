@@ -59,10 +59,47 @@ def _env_enablement():
     return seed
 
 
+async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id=None,
+                           media_files=None, force_document=False) -> dict:
+    """Out-of-process delivery for deliver=cws cron jobs (gateway not running).
+
+    CWS needs no live socket to send — a short-lived REST client suffices."""
+    from cws_agent_sdk import CwsConfig
+    from cws_agent_sdk.http import CwsHttpClient
+    from cws_agent_sdk.providers import FileStorage
+    from cws_agent_sdk.services import CommService
+    from cws_agent_sdk.token import TokenManager
+
+    cfg = CwsConfig.from_env()
+    tokens = TokenManager(cfg, storage=FileStorage("~/.hermes/platforms/cws"))
+    http = CwsHttpClient(cfg, tokens)
+    try:
+        receipt = await CommService(http).send_message(chat_id, message)
+        return {"success": True, "message_id": receipt.message_id}
+    except Exception as exc:  # noqa: BLE001 — cron caller expects a dict, not a raise
+        return {"success": False, "error": str(exc)}
+    finally:
+        await http.aclose()
+        await tokens.aclose()
+
+
 def register(ctx):
     """Hermes plugin entry point."""
+    from pathlib import Path
+
     from .adapter import CwsAdapter
     from .tools import ALL_TOOLS
+
+    skill_path = Path(__file__).parent / "skills" / "workspace.md"
+    if skill_path.exists():
+        try:
+            ctx.register_skill(
+                name="workspace",
+                path=skill_path,
+                description="OpenMax workspace 工作手册:issue 生命周期、KB 约定、汇报礼仪",
+            )
+        except Exception:  # noqa: BLE001 — skill registration is an enhancement
+            pass
 
     for name, schema, handler, emoji in ALL_TOOLS:
         ctx.register_tool(
@@ -85,6 +122,7 @@ def register(ctx):
         install_hint="pip install hermes-openmax (deps: httpx, websockets)",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="CWS_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
         allowed_users_env="CWS_ALLOWED_USERS",
         allow_all_env="CWS_ALLOW_ALL_USERS",
         emoji="🏢",

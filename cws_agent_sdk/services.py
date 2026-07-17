@@ -110,6 +110,29 @@ class CommService:
             "/api/v1/conversations/dm", json={"peer_member_id": peer_member_id}
         )
 
+    async def list_conversations(
+        self, limit: int = 50, *, include_archived: bool = False, search_name: str = ""
+    ) -> list[dict]:
+        """Rows are userConversationItem: {conversation, unread_count,
+        unread_mention, is_pinned, is_muted, last_read_seq, ...}."""
+        params: dict[str, Any] = {"limit": limit}
+        if include_archived:
+            params["include_archived"] = True
+        if search_name:
+            params["search_name"] = search_name
+        items, _ = await self._http.get_page("/api/v1/conversations", params=params)
+        return items
+
+    async def create_group(
+        self, name: str, member_ids: list[str], *, description: str = "", metadata: Optional[dict] = None
+    ) -> dict:
+        body: dict[str, Any] = {"name": name, "member_ids": member_ids}
+        if description:
+            body["description"] = description
+        if metadata:
+            body["metadata"] = metadata
+        return await self._http.post("/api/v1/conversations/groups", json=body)
+
 
 class CoreService:
     """Directory / identity (cws-core)."""
@@ -190,6 +213,100 @@ class TmService:
         """action: transition | claim | start | reassign"""
         return await self._http.post(f"/api/v1/tasks/{task_id}/{action}", json=body or {})
 
+    # -- comments (work_type: issue|task) -----------------------------------
+
+    async def create_comment(self, work_type: str, work_id: str, body_markdown: str) -> dict:
+        return await self._http.post(
+            "/api/v1/comments",
+            json={"work_type": work_type, "work_id": work_id, "body_markdown": body_markdown},
+        )
+
+    async def list_comments(self, work_type: str, work_id: str, limit: int = 50) -> list[dict]:
+        items, _ = await self._http.get_page(
+            "/api/v1/comments",
+            params={"work_type": work_type, "work_id": work_id, "limit": limit},
+        )
+        return items
+
+    # -- work references (proj://<id> / issue://<id>) -------------------------
+
+    async def work_references(
+        self, *, query: str = "", project_id: str = "", limit: int = 20
+    ) -> list[dict]:
+        """Search projects/issues; rows: {kind, id, label, resource_uri, status, ...}."""
+        params: dict[str, Any] = {"limit": limit}
+        if query:
+            params["query"] = query
+        if project_id:
+            params["project_id"] = project_id
+        data = await self._http.get("/api/v1/work-references", params=params)
+        return data if isinstance(data, list) else data.get("items", [])
+
+    # -- blueprints -----------------------------------------------------------
+
+    async def create_blueprint(self, issue_id: str, steps: list[dict], *, notes: str = "") -> dict:
+        body: dict[str, Any] = {"steps": steps}
+        if notes:
+            body["notes"] = notes
+        return await self._http.post(f"/api/v1/issues/{issue_id}/blueprints", json=body)
+
+    async def get_blueprint(self, blueprint_id: str, *, include_steps: bool = True) -> dict:
+        return await self._http.get(
+            f"/api/v1/blueprints/{blueprint_id}", params={"include_steps": include_steps}
+        )
+
+    async def list_blueprints(self, issue_id: str) -> list[dict]:
+        items, _ = await self._http.get_page(f"/api/v1/issues/{issue_id}/blueprints")
+        return items
+
+    async def submit_blueprint(self, blueprint_id: str) -> dict:
+        return await self._http.post(f"/api/v1/blueprints/{blueprint_id}/submit-for-approval")
+
+    async def set_blueprint_steps(self, blueprint_id: str, steps: list[dict]) -> dict:
+        return await self._http.request(
+            "PUT", f"/api/v1/blueprints/{blueprint_id}/steps", json={"steps": steps}
+        )
+
+    # -- attempts --------------------------------------------------------------
+
+    async def create_attempt(self, task_id: str) -> dict:
+        """Assignee = the authenticated caller; body is empty by contract."""
+        return await self._http.post(f"/api/v1/tasks/{task_id}/attempts")
+
+    async def list_attempts(self, task_id: str) -> list[dict]:
+        items, _ = await self._http.get_page(f"/api/v1/tasks/{task_id}/attempts")
+        return items
+
+    async def transition_attempt(
+        self, attempt_id: str, target_status: str, *, failure_reason: str = ""
+    ) -> dict:
+        """target_status: done | failed | blocked | cancelled (terminal only)."""
+        body: dict[str, Any] = {"target_status": target_status}
+        if failure_reason:
+            body["failure_reason"] = failure_reason
+        return await self._http.post(f"/api/v1/attempts/{attempt_id}/transition", json=body)
+
+    # -- event bindings (v0.7: timer -> create issue from template) -------------
+
+    async def create_event_binding(
+        self, cron_expr: str, lead_member_id: str, spec: dict, *, owner_member_id: str = ""
+    ) -> dict:
+        body: dict[str, Any] = {
+            "cron_expr": cron_expr,
+            "lead_member_id": lead_member_id,
+            "spec": spec,
+        }
+        if owner_member_id:
+            body["owner_member_id"] = owner_member_id  # required for agent callers
+        return await self._http.post("/api/v1/event-bindings", json=body)
+
+    async def list_event_bindings(self) -> list[dict]:
+        data = await self._http.get("/api/v1/event-bindings")
+        return data if isinstance(data, list) else data.get("items", [])
+
+    async def delete_event_binding(self, event_binding_id: str) -> None:
+        await self._http.request("DELETE", f"/api/v1/event-bindings/{event_binding_id}")
+
 
 class KbService:
     """Knowledge base (cws-kb via BFF)."""
@@ -224,6 +341,67 @@ class KbService:
 
     async def get_tree(self, kb_id: str) -> dict:
         return await self._http.get(f"/api/v1/kbs/{kb_id}/tree")
+
+    # -- revisions --------------------------------------------------------------
+
+    async def list_revisions(self, page_id: str, limit: int = 20) -> list[dict]:
+        items, _ = await self._http.get_page(
+            f"/api/v1/pages/{page_id}/revisions", params={"limit": limit}
+        )
+        return items
+
+    async def get_revision(self, page_id: str, revision_id: int) -> dict:
+        return await self._http.get(f"/api/v1/pages/{page_id}/revisions/{revision_id}")
+
+    async def diff_revisions(self, page_id: str, from_revision: int, to_revision: int) -> dict:
+        return await self._http.get(
+            f"/api/v1/pages/{page_id}/revisions/diff",
+            params={"from_revision": from_revision, "to_revision": to_revision},
+        )
+
+    async def restore_revision(self, page_id: str, revision_id: int) -> dict:
+        return await self._http.post(
+            f"/api/v1/pages/{page_id}/revisions/{revision_id}/restore"
+        )
+
+    # -- trash / lifecycle -------------------------------------------------------
+
+    async def trash_page(self, page_id: str) -> dict:
+        return await self._http.post(f"/api/v1/pages/{page_id}/trash")
+
+    async def restore_page(self, page_id: str) -> dict:
+        return await self._http.post(f"/api/v1/pages/{page_id}/restore")
+
+    async def list_trashed(self, limit: int = 50) -> list[dict]:
+        items, _ = await self._http.get_page("/api/v1/pages/trashed", params={"limit": limit})
+        return items
+
+    async def freeze_page(self, page_id: str) -> dict:
+        return await self._http.post(f"/api/v1/pages/{page_id}/freeze")
+
+    # -- tree node ops ------------------------------------------------------------
+
+    async def create_folder(self, kb_id: str, name: str, parent_id: str = "") -> dict:
+        body: dict[str, Any] = {"name": name}
+        if parent_id:
+            body["parent_id"] = parent_id
+        return await self._http.post(f"/api/v1/kbs/{kb_id}/tree/folders", json=body)
+
+    async def rename_node(self, kb_id: str, node_id: str, name: str) -> None:
+        await self._http.request(
+            "PATCH", f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/rename", json={"name": name}
+        )
+
+    async def move_node(self, kb_id: str, node_id: str, parent_id: str = "") -> None:
+        body = {"parent_id": parent_id} if parent_id else {}
+        await self._http.post(f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/move", json=body)
+
+    async def delete_node(self, kb_id: str, node_id: str) -> None:
+        await self._http.request("DELETE", f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}")
+
+    async def download_node(self, kb_id: str, node_id: str) -> dict:
+        """Returns {node_id, name, download_url(presigned), content_type, ...}."""
+        return await self._http.get(f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/download")
 
 
 class AsService:

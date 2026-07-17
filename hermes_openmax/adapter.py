@@ -198,6 +198,7 @@ class CwsAdapter(BasePlatformAdapter):
                 **msg.metadata,
             },
             channel_prompt=self._orientation or None,
+            channel_context=msg.metadata.get("work_reference_context") or None,
             raw_message=msg.raw,
         )
         await self.handle_message(event)

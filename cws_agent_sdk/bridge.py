@@ -261,6 +261,7 @@ class CwsBridge:
             if not msg.sender_name and msg.sender_id:
                 msg.sender_name = await self._member_name(msg.sender_id)
             await self._hydrate_media(msg)
+            await self._expand_work_references(msg)
             decision = decide_inbound(
                 msg,
                 self_member_id=self._cfg.member_id,
@@ -391,6 +392,36 @@ class CwsBridge:
             except Exception as exc:  # noqa: BLE001 — download is best-effort
                 self._log.warn("attachment download failed:", exc)
             msg.media.append(entry)
+
+    async def _expand_work_references(self, msg: InboundMessage) -> None:
+        """Expand proj://<id> / issue://<id> URIs in the message into context.
+
+        Result lands in msg.metadata['work_reference_context'] (plain text);
+        the adapter forwards it as out-of-band channel context. Best-effort."""
+        import re
+
+        refs = re.findall(r"\b(proj|issue)://([0-9a-fA-F-]{36})", msg.text or "")
+        if not refs:
+            return
+        blocks: list[str] = []
+        for kind, ref_id in refs[:3]:
+            try:
+                if kind == "issue":
+                    issue = await self.tm.get_issue(ref_id)
+                    blocks.append(
+                        f"[issue://{ref_id}] title={issue.get('title')!r} "
+                        f"status={issue.get('status')} owner={issue.get('owner_member_id')}"
+                    )
+                else:
+                    rows = await self.tm.work_references(project_id=ref_id, limit=10)
+                    labels = [f"{r.get('kind')}:{r.get('label')}({r.get('status','')})" for r in rows]
+                    blocks.append(f"[proj://{ref_id}] issues: {', '.join(labels) or '(none)'}")
+            except Exception as exc:  # noqa: BLE001 — reference expansion is best-effort
+                self._log.warn("work-reference expand failed:", exc)
+        if blocks:
+            msg.metadata["work_reference_context"] = (
+                "Referenced workspace items:\n" + "\n".join(blocks)
+            )
 
     def _effective_policy(self, conversation_id: str) -> AccessPolicyConfig:
         """Apply a per-conversation group-mode override on top of the base policy."""
