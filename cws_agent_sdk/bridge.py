@@ -99,6 +99,7 @@ class CwsBridge:
         )
         self._metrics_interval_s = metrics_interval_s
         self._metrics_task: Optional[asyncio.Task] = None
+        self._bg_tasks: set[asyncio.Task] = set()
         self._on_config_event = on_config_event
         self._ack_reaction = ack_reaction
         self._ack_ttl_s = ack_reaction_ttl_s
@@ -142,7 +143,12 @@ class CwsBridge:
         self._ws.start()
         # Catch up in the background — /sync replay can take a while after
         # downtime and must not stall the host's connect timeout.
-        asyncio.create_task(self._sync_missed(), name="cws-initial-sync")
+        self._spawn_bg(self._sync_missed(), "cws-initial-sync")
+
+    def _spawn_bg(self, coro, name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def stop(self) -> None:
         self._running = False
@@ -150,6 +156,8 @@ class CwsBridge:
         if self._metrics_task:
             self._metrics_task.cancel()
             self._metrics_task = None
+        for task in list(self._bg_tasks):
+            task.cancel()
         await self._ws.stop()
         await self._http.aclose()
         await self._tokens.aclose()
@@ -442,7 +450,7 @@ class CwsBridge:
             self._log.warn("ack reaction failed:", exc)
             return
         self._pending_acks[conversation_id] = message_id
-        asyncio.create_task(self._expire_ack(conversation_id, message_id))
+        self._spawn_bg(self._expire_ack(conversation_id, message_id), "cws-ack-expire")
 
     async def _expire_ack(self, conversation_id: str, message_id: str) -> None:
         await asyncio.sleep(self._ack_ttl_s)
