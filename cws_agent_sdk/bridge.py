@@ -53,6 +53,8 @@ class CwsBridge:
         billing_gate_enabled: bool = True,
         metrics_interval_s: float = 300.0,
         on_config_event: Optional[Callable[[str, dict], Awaitable[None]]] = None,
+        ack_reaction: str = "eyes",  # "" disables the received-ack reaction
+        ack_reaction_ttl_s: float = 600.0,
     ):
         self._cfg = cfg
         self._storage = storage
@@ -82,6 +84,9 @@ class CwsBridge:
         self._on_config_event = on_config_event
         self.owner_member_id: str = ""
         self._group_mode_overrides: dict[str, str] = {}  # conv_id -> raw mode
+        self._ack_reaction = ack_reaction
+        self._ack_ttl_s = ack_reaction_ttl_s
+        self._pending_acks: dict[str, str] = {}  # conv_id -> message_id with our ack on it
         self._ws = CwsWsClient(
             cfg,
             ticket_provider=self._tokens.get_ws_ticket,
@@ -161,18 +166,72 @@ class CwsBridge:
 
         cmid = new_client_msg_id()
         self._remember_own(cmid)
-        return await self.comm.send_message(
+        receipt = await self.comm.send_message(
             conversation_id,
             content,
             reply_to=reply_to,
             metadata=metadata,
             client_msg_id=cmid,
         )
+        # Replying resolves the pending received-ack (zylos parity) and any
+        # lingering typing bubble.
+        await self._clear_ack(conversation_id)
+        try:
+            await self.send_typing(conversation_id, "stop")
+        except Exception:  # noqa: BLE001 — cosmetic
+            pass
+        return receipt
 
-    async def send_typing(self, conversation_id: str) -> None:
+    async def send_image_file(
+        self,
+        conversation_id: str,
+        image_path: str,
+        *,
+        caption: str = "",
+        reply_to: Optional[str] = None,
+    ) -> SendReceipt:
+        """Upload a local image (presigned two-phase) and send it as a native
+        IMAGE message with a proper attachment."""
+        import mimetypes
+        import os
+
+        import httpx as _httpx
+
+        size = os.path.getsize(image_path)
+        fname = os.path.basename(image_path)
+        ctype = mimetypes.guess_type(fname)[0] or "image/png"
+        prep = await self.artifacts.prepare_conversation_upload(
+            conversation_id, fname, ctype, size
+        )
+        if not prep.get("instant_upload"):
+            with open(image_path, "rb") as fh:
+                async with _httpx.AsyncClient(timeout=300) as up:
+                    resp = await up.put(
+                        prep["upload_url"], content=fh.read(),
+                        headers=prep.get("headers") or {},
+                    )
+                    resp.raise_for_status()
+        fin = await self.artifacts.finalize_conversation_upload(prep["upload_token"])
+        receipt = await self.comm.send_image_message(
+            conversation_id,
+            artifact_id=str(fin.get("artifact_id", "")),
+            file_name=fname,
+            content_type=ctype,
+            size_bytes=size,
+            caption=caption,
+            reply_to=reply_to,
+        )
+        await self._clear_ack(conversation_id)
+        return receipt
+
+    async def send_typing(self, conversation_id: str, action: str = "start") -> None:
         if self._ws.is_open():
             await self._ws.send_text(
-                encode_typing(conversation_id, self._cfg.member_id or self._cfg.identity_id)
+                encode_typing(
+                    conversation_id,
+                    self._cfg.member_id or self._cfg.identity_id,
+                    action,
+                )
             )
 
     async def get_conversation_info(self, conversation_id: str) -> dict:
@@ -282,12 +341,40 @@ class CwsBridge:
                 self._mark_seen(key)
                 await self._advance(conversation_id, msg.seq or seq)
                 return
+            await self._ack_received(conversation_id, str(message_id))
             # Delivery point — exceptions propagate, watermark stays put, /sync replays.
             await self._on_message(msg)
             self._mark_seen(key)
             await self._advance(conversation_id, msg.seq or seq)
         finally:
             self._inflight.discard(key)
+
+    # -- received-ack reaction (zylos parity: 👀 on receipt, cleared on reply) --
+
+    async def _ack_received(self, conversation_id: str, message_id: str) -> None:
+        if not self._ack_reaction:
+            return
+        try:
+            await self.comm.add_reaction(message_id, self._ack_reaction)
+        except Exception as exc:  # noqa: BLE001 — ack is cosmetic
+            self._log.warn("ack reaction failed:", exc)
+            return
+        self._pending_acks[conversation_id] = message_id
+        asyncio.create_task(self._expire_ack(conversation_id, message_id))
+
+    async def _expire_ack(self, conversation_id: str, message_id: str) -> None:
+        await asyncio.sleep(self._ack_ttl_s)
+        if self._pending_acks.get(conversation_id) == message_id:
+            await self._clear_ack(conversation_id)
+
+    async def _clear_ack(self, conversation_id: str) -> None:
+        message_id = self._pending_acks.pop(conversation_id, "")
+        if not message_id or not self._ack_reaction:
+            return
+        try:
+            await self.comm.remove_reaction(message_id, self._ack_reaction)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warn("ack reaction clear failed:", exc)
 
     def _normalize(
         self, detail: dict, conversation_id: str, seq: int

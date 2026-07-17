@@ -74,6 +74,62 @@ class CommService:
         )
         return items
 
+    async def send_image_message(
+        self,
+        conversation_id: str,
+        *,
+        artifact_id: str,
+        file_name: str,
+        content_type: str,
+        size_bytes: int,
+        caption: str = "",
+        reply_to: Optional[str] = None,
+        client_msg_id: Optional[str] = None,
+    ) -> SendReceipt:
+        """Send a native IMAGE message referencing a finalized upload."""
+        body: dict[str, Any] = {
+            "client_msg_id": client_msg_id or new_client_msg_id(),
+            "type": "IMAGE",
+            "content": {
+                "content_type": "image",
+                "body": {"text": caption} if caption else {},
+                "attachments": [
+                    {
+                        "artifact_id": artifact_id,
+                        "file_name": file_name,
+                        "content_type": content_type,
+                        "size_bytes": int(size_bytes),
+                    }
+                ],
+            },
+            "priority": 3,
+        }
+        if reply_to:
+            body["parent_id"] = str(reply_to)
+        data = await self._http.post(
+            f"/api/v1/conversations/{conversation_id}/messages", json=body
+        )
+        return SendReceipt(
+            message_id=str(data.get("id", "")),
+            conversation_id=str(data.get("conversation_id", conversation_id)),
+            raw=data,
+        )
+
+    # -- reactions ---------------------------------------------------------
+
+    async def add_reaction(self, message_id: str | int, reaction_code: str) -> None:
+        """Idempotent. Codes from the server registry: thumbs_up, smile, heart,
+        tada, eyes, joy, fire, white_check_mark, ok_hand, x, hourglass, warning."""
+        await self._http.post(
+            f"/api/v1/messages/{message_id}/reactions",
+            json={"reaction_code": reaction_code},
+        )
+
+    async def remove_reaction(self, message_id: str | int, reaction_code: str) -> None:
+        await self._http.request(
+            "DELETE", f"/api/v1/messages/{message_id}/reactions/{reaction_code}"
+        )
+
     # -- cursors -----------------------------------------------------------
 
     async def mark_read(self, conversation_id: str, read_until_seq: int) -> int:

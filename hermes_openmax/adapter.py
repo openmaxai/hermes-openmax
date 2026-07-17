@@ -81,6 +81,9 @@ class CwsAdapter(BasePlatformAdapter):
         if missing:
             logger.error("[cws] missing config: %s", ", ".join(missing))
             return False
+        import os
+
+        ack = os.getenv("CWS_ACK_REACTION", "eyes").strip()
         self._bridge = CwsBridge(
             cfg,
             storage=FileStorage(_STATE_DIR),
@@ -89,6 +92,7 @@ class CwsAdapter(BasePlatformAdapter):
             policy=_policy_from_env(),
             version=cfg.client_version,
             on_config_event=self._on_config_event,
+            ack_reaction="" if ack.lower() in ("off", "false", "none") else ack,
         )
         await self._bridge.start()
         logger.info("[cws] bridge started (org=%s)", cfg.org_id or "<from-token>")
@@ -155,7 +159,7 @@ class CwsAdapter(BasePlatformAdapter):
             logger.warning("[cws] send failed conv=%s: %s", chat_id, exc)
             return SendResult(success=False, error=str(exc))
 
-    async def send_typing(self, chat_id: str) -> None:
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if self._bridge:
             try:
                 await self._bridge.send_typing(chat_id)
@@ -204,6 +208,34 @@ class CwsAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     # -- outbound media -------------------------------------------------------
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Native local-image delivery (the gateway's MEDIA path calls this,
+        not send_image)."""
+        if not self._bridge:
+            return SendResult(success=False, error="cws bridge not connected")
+        try:
+            receipt = await self._bridge.send_image_file(
+                chat_id, image_path, caption=caption or "", reply_to=reply_to
+            )
+            return SendResult(success=True, message_id=receipt.message_id)
+        except Exception as exc:  # noqa: BLE001 — fall back to caption-only text
+            logger.warning("[cws] send_image_file failed: %s", exc)
+            try:
+                receipt = await self._bridge.send(
+                    chat_id, f"{caption or ''}\n⚠️ 图片发送失败".strip(), reply_to=reply_to
+                )
+                return SendResult(success=True, message_id=receipt.message_id)
+            except Exception as exc2:  # noqa: BLE001
+                return SendResult(success=False, error=str(exc2))
 
     async def send_image(
         self,

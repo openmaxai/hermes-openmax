@@ -29,6 +29,19 @@ class FakeComm:
     async def get_conversation(self, conv_id):
         return {"id": conv_id, "type": getattr(self, "conv_type", "dm")}
 
+    async def add_reaction(self, message_id, code):
+        self.reactions_added = getattr(self, "reactions_added", [])
+        self.reactions_added.append((str(message_id), code))
+
+    async def remove_reaction(self, message_id, code):
+        self.reactions_removed = getattr(self, "reactions_removed", [])
+        self.reactions_removed.append((str(message_id), code))
+
+    async def send_message(self, conv_id, text, **kw):
+        from cws_agent_sdk.types import SendReceipt
+
+        return SendReceipt(message_id="out-1", conversation_id=conv_id)
+
 
 def make_bridge(tmp_path, on_message, member_id="me-1"):
     cfg = CwsConfig(
@@ -162,3 +175,21 @@ async def test_concurrent_duplicate_delivery_suppressed(tmp_path):
     )
     assert len(got) == 1
     assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.asyncio
+async def test_ack_reaction_added_and_cleared_on_reply(tmp_path):
+    got = []
+
+    async def on_message(m):
+        got.append(m)
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.messages["conv-1:1"] = detail()
+    await b._handle_frame(msg_frame())
+    assert b.comm.reactions_added == [("1", "eyes")]
+    assert b._pending_acks["conv-1"] == "1"
+
+    await b.send("conv-1", "reply!")
+    assert b.comm.reactions_removed == [("1", "eyes")]
+    assert "conv-1" not in b._pending_acks
