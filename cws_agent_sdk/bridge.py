@@ -296,9 +296,25 @@ class CwsBridge:
         # typing / read_state / presence / acks: no runtime delivery needed.
 
     async def _handle_system_frame(self, frame: Frame) -> None:
-        """agent.config.* hot updates: {event, conversation_id, data}."""
+        """System frames: agent.config.* hot updates, recall/edit events."""
+        from .codec import classify_system_event
+
         event = str(frame.payload.get("event", ""))
         data = frame.payload.get("data") or {}
+        kind = classify_system_event(event)
+        if kind == "recall":
+            conv = str(frame.payload.get("conversation_id", ""))
+            if conv in self._group_history:
+                self._group_history[conv].append("[system] 上一条消息已被撤回")
+            if self._on_config_event:
+                try:
+                    await self._on_config_event(event, data)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        if kind == "edit":
+            # Refetch on next reference; nothing cached long-term to fix up.
+            return
         if not event.startswith("agent.config."):
             return
         self._log.log("config event:", event)

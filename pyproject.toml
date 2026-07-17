@@ -18,6 +18,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "jsonschema>=4.21",  # contract conformance harness (tests/test_contract.py)
 ]
 
 # Hermes pip-plugin discovery (hermes_agent.plugins entry-point group).

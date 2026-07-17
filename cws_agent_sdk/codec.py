@@ -9,6 +9,7 @@ clients refetch the body over REST.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -100,6 +101,44 @@ def encode_read_receipt(conversation_id: str, read_until_seq: int) -> str:
             },
         }
     )
+
+
+# -- contract v1 classification (openmax-agent-sdk schemas/v1) ---------------
+
+_FRAME_KIND = {
+    FRAME_MESSAGE: "message",
+    FRAME_MESSAGE_ACK: "message_ack",
+    FRAME_SYSTEM: "system",
+    FRAME_ERROR: "error",
+    FRAME_PING: "heartbeat",
+    FRAME_PONG: "heartbeat",
+    FRAME_TYPING: "presence",
+    FRAME_READ_STATE: "presence",
+    FRAME_READ_RECEIPT: "presence",
+    FRAME_DELIVERY_STATE: "presence",
+    FRAME_PRESENCE: "presence",
+}
+
+
+def classify_frame(frame: dict) -> str:
+    """Contract FrameKind: message/message_ack/system/error/heartbeat/presence/unknown."""
+    return _FRAME_KIND.get(str((frame or {}).get("type", "")), "unknown")
+
+
+def classify_system_event(event: str) -> Optional[str]:
+    """Contract system-event classes: recall/edit/config_update/connection/channel/None."""
+    e = str(event or "")
+    if e in ("message.recalled", "message.deleted"):
+        return "recall"
+    if e == "message.updated":
+        return "edit"
+    if e.startswith("agent.config."):
+        return "config_update"
+    if e.startswith("connection."):
+        return "connection"
+    if e.startswith("channel."):
+        return "channel"
+    return None
 
 
 def new_client_msg_id() -> str:
