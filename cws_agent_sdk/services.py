@@ -28,13 +28,15 @@ class CommService:
         priority: int = 3,
         client_msg_id: Optional[str] = None,
     ) -> SendReceipt:
+        from .codec import looks_like_markdown
+
+        # zylos-openmax parity: agent outbound text is AGENT_TEXT, and the FE
+        # renders markdown only when content_type says so.
+        content_type = "markdown" if looks_like_markdown(text) else "text"
         body: dict[str, Any] = {
             "client_msg_id": client_msg_id or new_client_msg_id(),
-            "type": "TEXT",
-            # NOTE: body shape pending verification against a live env — the
-            # BFF schema only constrains {content_type, body(map)}; adjust the
-            # inner key here if the workspace FE expects a different one.
-            "content": {"content_type": "text", "body": {"text": text}},
+            "type": "AGENT_TEXT",
+            "content": {"content_type": content_type, "body": {"text": text}, "attachments": []},
             "priority": priority,
         }
         if reply_to:
@@ -87,12 +89,18 @@ class CommService:
         client_msg_id: Optional[str] = None,
     ) -> SendReceipt:
         """Send a native IMAGE message referencing a finalized upload."""
+        # zylos-openmax hard-won contract: body MUST carry file_name (an empty
+        # body renders as a blank bubble in cws-fe); caption goes in body.text
+        # so image + caption arrive as ONE message.
+        content_body: dict[str, Any] = {"file_name": file_name}
+        if caption:
+            content_body["text"] = caption
         body: dict[str, Any] = {
             "client_msg_id": client_msg_id or new_client_msg_id(),
             "type": "IMAGE",
             "content": {
                 "content_type": "image",
-                "body": {"text": caption} if caption else {},
+                "body": content_body,
                 "attachments": [
                     {
                         "artifact_id": artifact_id,

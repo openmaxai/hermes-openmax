@@ -93,3 +93,23 @@ def encode_read_receipt(conversation_id: str, read_until_seq: int) -> str:
 def new_client_msg_id() -> str:
     """Idempotency key for outbound sends (<=64 chars)."""
     return f"hermes-{uuid.uuid4().hex}"
+
+
+def looks_like_markdown(text: str) -> bool:
+    """Port of zylos-openmax's outbound markdown heuristic — the FE renders
+    content_type 'markdown' differently from plain 'text'."""
+    import re
+
+    if not text:
+        return False
+    patterns = (
+        r"(^|\n)#{1,6}\s",          # headers
+        r"\*\*[^*\n]+\*\*",          # bold
+        r"(^|\n)\s*[-*+]\s+\S",      # bullet list
+        r"(^|\n)\s*\d+\.\s+\S",      # ordered list
+        r"```",                       # code fence
+        r"\[[^\]\n]+\]\([^)\n]+\)",  # link
+        r"(^|\n)>\s+\S",             # blockquote
+        r"`[^`\n]+`",                # inline code
+    )
+    return any(re.search(p, text) for p in patterns)
