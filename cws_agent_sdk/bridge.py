@@ -316,11 +316,15 @@ class CwsBridge:
                 self._mark_seen(key)
                 await self._advance(conversation_id, seq)
                 return
-            msg.conversation_type = await self._conversation_type(conversation_id)
+            conv_info = await self._conversation_info(conversation_id)
+            msg.conversation_type = conv_info["type"]
+            if conv_info.get("name"):
+                msg.metadata["conversation_name"] = conv_info["name"]
             if not msg.sender_name and msg.sender_id:
                 msg.sender_name = await self._member_name(msg.sender_id)
             await self._hydrate_media(msg)
             await self._expand_work_references(msg)
+            await self._hydrate_reply_context(msg)
             decision = decide_inbound(
                 msg,
                 self_member_id=self._cfg.member_id,
@@ -514,6 +518,24 @@ class CwsBridge:
                 "Referenced workspace items:\n" + "\n".join(blocks)
             )
 
+    async def _hydrate_reply_context(self, msg: InboundMessage) -> None:
+        """Quoted-reply context (formatInboundForC4 parity): fetch the parent
+        message's text + author so the runtime sees what is being replied to."""
+        if not msg.reply_to_message_id:
+            return
+        try:
+            detail = await self.comm.get_message(msg.conversation_id, msg.reply_to_message_id)
+            parent = detail.get("message") or detail
+            content = detail.get("content") or parent.get("content") or {}
+            text = self._extract_text(parent, content)
+            author_id = str(parent.get("sender_id", ""))
+            msg.metadata["reply_to_text"] = text[:2000]
+            msg.metadata["reply_to_author_id"] = author_id
+            if author_id:
+                msg.metadata["reply_to_author_name"] = await self._member_name(author_id)
+        except Exception as exc:  # noqa: BLE001 — quote context is best-effort
+            self._log.warn("reply-context hydrate failed:", exc)
+
     def _effective_policy(self, conversation_id: str) -> AccessPolicyConfig:
         """Apply a per-conversation group-mode override on top of the base policy."""
         mode = self._group_mode_overrides.get(conversation_id, "")
@@ -528,20 +550,24 @@ class CwsBridge:
             return replace(self._policy, group_require_mention=False)
         return self._policy
 
-    async def _conversation_type(self, conversation_id: str) -> str:
+    async def _conversation_info(self, conversation_id: str) -> dict:
         cached = self._conv_types.get(conversation_id)
         if cached:
             return cached
-        conv_type = "dm"
+        info_out = {"type": "dm", "name": ""}
         try:
             info = await self.comm.get_conversation(conversation_id)
-            conv_type = str(info.get("type", "dm")).lower() or "dm"
-        except CwsApiError as exc:
+            info_out["type"] = str(info.get("type", "dm")).lower() or "dm"
+            info_out["name"] = str(info.get("name") or "")
+        except Exception as exc:  # noqa: BLE001 — assume dm on failure
             self._log.warn("get_conversation failed, assuming dm:", exc)
-        self._conv_types[conversation_id] = conv_type
+        self._conv_types[conversation_id] = info_out
         while len(self._conv_types) > 512:
             self._conv_types.popitem(last=False)
-        return conv_type
+        return info_out
+
+    async def _conversation_type(self, conversation_id: str) -> str:
+        return (await self._conversation_info(conversation_id))["type"]
 
     # -- watermarks ---------------------------------------------------------
 

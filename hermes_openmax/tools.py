@@ -51,7 +51,8 @@ TASKS_SCHEMA = {
     "name": "workspace_tasks",
     "description": (
         "Operate OpenMax workspace projects/issues/tasks (cws-work). Actions: "
-        "list_projects, list_issues(project_id?), get_issue(issue_id), "
+        "list_projects, project_create(body{name,lead_member_id,description?}), "
+        "task_get(task_id), list_issues(project_id?), get_issue(issue_id), "
         "create_issue(project_id, body{title,owner_member_id,...}), "
         "update_issue(issue_id, body), "
         "issue_action(issue_id, name=activate|submit-plan|accept-plan|deliver|resume|terminate|accept-delivered, body?), "
@@ -100,6 +101,14 @@ def handle_tasks(args: dict, **kw: Any) -> str:
         body = args.get("body") or {}
         if a == "list_projects":
             return await tm.list_projects(limit=limit)
+        if a == "project_create":
+            return await tm.create_project(
+                body.get("name") or args.get("name", ""),
+                body.get("lead_member_id", ""),
+                description=body.get("description", ""),
+            )
+        if a == "task_get":
+            return await tm.get_task(args["task_id"])
         if a == "list_issues":
             return await tm.list_issues(args.get("project_id"), limit=limit)
         if a == "get_issue":
@@ -247,7 +256,9 @@ MEMBERS_SCHEMA = {
     "name": "workspace_members",
     "description": (
         "OpenMax workspace directory. Actions: me, list(kind=human|agent, search?), "
-        "get(member_id), create_dm(peer_member_id)"
+        "get(member_id), create_dm(peer_member_id), "
+        "agent_profiles(project_id?) -> capability profiles (skills/tags/online) — "
+        "MUST consult before assigning work to agents, rename(name)"
     ),
     "parameters": {
         "type": "object",
@@ -275,6 +286,20 @@ def handle_members(args: dict, **kw: Any) -> str:
             return await core.get_member(args["member_id"])
         if a == "create_dm":
             return await comm.create_dm(args["peer_member_id"])
+        if a == "agent_profiles":
+            project_id = args.get("project_id", "")
+            if not project_id and not args.get("member_id"):
+                # Server requires a scope — fall back to the org default project.
+                projects = await svc["tm"].list_projects(limit=50)
+                default = next(
+                    (p for p in projects if p.get("is_default")), projects[0] if projects else None
+                )
+                project_id = str((default or {}).get("id", ""))
+            return await core.list_agent_profiles(
+                project_id=project_id, member_id=args.get("member_id", "")
+            )
+        if a == "rename":
+            return await core.set_display_name(args["name"])
         return {"error": f"unknown action {a!r}"}
 
     return _run(go)

@@ -228,6 +228,20 @@ class CoreService:
             "PATCH", "/api/v1/me/display-name", json={"display_name": display_name}
         )
 
+    async def list_agent_profiles(
+        self, *, project_id: str = "", member_id: str = "", limit: int = 50
+    ) -> list[dict]:
+        """Agent capability profiles (skills + tags + description + online) —
+        MUST be consulted before assigning steps to agents (guardrail).
+        Server requires a scope: project_id and/or member_id."""
+        params: dict[str, Any] = {"limit": limit}
+        if project_id:
+            params["project_id"] = project_id
+        if member_id:
+            params["member_id"] = member_id
+        items, _ = await self._http.get_page("/api/v1/agent-profiles", params=params)
+        return items
+
     async def list_organizations(self) -> list[dict]:
         items, _ = await self._http.get_page("/api/v1/organizations")
         return items
@@ -242,6 +256,15 @@ class TmService:
     async def list_projects(self, limit: int = 50) -> list[dict]:
         items, _ = await self._http.get_page("/api/v1/projects", params={"limit": limit})
         return items
+
+    async def create_project(self, name: str, lead_member_id: str, *, description: str = "") -> dict:
+        body: dict[str, Any] = {"name": name, "lead_member_id": lead_member_id}
+        if description:
+            body["description"] = description
+        return await self._http.post("/api/v1/projects", json=body)
+
+    async def get_task(self, task_id: str) -> dict:
+        return await self._http.get(f"/api/v1/tasks/{task_id}")
 
     async def list_issues(self, project_id: Optional[str] = None, limit: int = 50) -> list[dict]:
         path = f"/api/v1/projects/{project_id}/issues" if project_id else "/api/v1/issues"

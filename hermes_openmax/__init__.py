@@ -90,16 +90,29 @@ def register(ctx):
     from .adapter import CwsAdapter
     from .tools import ALL_TOOLS
 
-    skill_path = Path(__file__).parent / "skills" / "workspace.md"
-    if skill_path.exists():
-        try:
-            ctx.register_skill(
-                name="workspace",
-                path=skill_path,
-                description="OpenMax workspace 工作手册:issue 生命周期、KB 约定、汇报礼仪",
-            )
-        except Exception:  # noqa: BLE001 — skill registration is an enhancement
-            pass
+    skills_dir = Path(__file__).parent / "skills"
+    _skills = [
+        ("workspace", skills_dir / "workspace.md",
+         "OpenMax workspace 工作纪律(Guided Autonomy):任务流/状态机/护栏/礼仪"),
+        ("tm-ops", skills_dir / "ops" / "tm.md",
+         "TM 操作手册:Project/Issue/Task/Attempt/Blueprint/评论/定时绑定"),
+        ("kb-ops", skills_dir / "ops" / "kb.md",
+         "KB 操作手册:页面/目录树/版本/回收站/搜索"),
+        ("as-ops", skills_dir / "ops" / "as.md",
+         "文件/附件操作手册:上传/下载/MEDIA 纪律"),
+        ("comm-ops", skills_dir / "ops" / "comm.md",
+         "会话操作手册:主动 DM/建群/历史"),
+        ("core-ops", skills_dir / "ops" / "core.md",
+         "目录/身份操作手册:成员/能力画像/改名"),
+        ("conn-ops", skills_dir / "ops" / "conn.md",
+         "第三方连接能力说明(暂无工具)"),
+    ]
+    for skill_name, skill_path, desc in _skills:
+        if skill_path.exists():
+            try:
+                ctx.register_skill(name=skill_name, path=skill_path, description=desc)
+            except Exception:  # noqa: BLE001 — skill registration is an enhancement
+                pass
 
     for name, schema, handler, emoji in ALL_TOOLS:
         ctx.register_tool(

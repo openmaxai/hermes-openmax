@@ -213,18 +213,26 @@ class CwsAdapter(BasePlatformAdapter):
         from advancing, so the message is replayed via /sync later."""
         source = self.build_source(
             chat_id=msg.conversation_id,
+            chat_name=msg.metadata.get("conversation_name") or None,
             chat_type="dm" if msg.conversation_type == "dm" else "group",
             user_id=msg.sender_id or None,
             user_name=msg.sender_name or None,
             is_bot=(msg.sender_type == "agent"),
             message_id=msg.message_id,
         )
+        self_member = self._bridge._cfg.member_id if self._bridge else ""
         event = MessageEvent(
             text=msg.text,
             message_type=MessageType.TEXT,
             source=source,
             message_id=msg.message_id,
             reply_to_message_id=msg.reply_to_message_id,
+            reply_to_text=msg.metadata.get("reply_to_text"),
+            reply_to_author_id=msg.metadata.get("reply_to_author_id"),
+            reply_to_author_name=msg.metadata.get("reply_to_author_name"),
+            reply_to_is_own_message=bool(
+                self_member and msg.metadata.get("reply_to_author_id") == self_member
+            ),
             media_urls=[m["path"] for m in msg.media if m.get("path")],
             media_types=[m.get("type", "") for m in msg.media],
             metadata={
