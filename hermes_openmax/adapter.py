@@ -96,7 +96,11 @@ class CwsAdapter(BasePlatformAdapter):
         )
         await self._bridge.start()
         logger.info("[cws] bridge started (org=%s)", cfg.org_id or "<from-token>")
-        await self._build_orientation()
+        # Orientation needs several REST calls — build it off the connect path
+        # so slow starts don't trip the gateway's connect timeout.
+        import asyncio
+
+        asyncio.create_task(self._build_orientation())
         return True
 
     async def _build_orientation(self) -> None:

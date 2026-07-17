@@ -115,8 +115,9 @@ class CwsBridge:
             await self._online.report(self._cfg.member_id)
             self._metrics_task = asyncio.create_task(self._metrics_loop(), name="cws-metrics")
         self._ws.start()
-        # Catch up anything missed while offline.
-        await self._sync_missed()
+        # Catch up in the background — /sync replay can take a while after
+        # downtime and must not stall the host's connect timeout.
+        asyncio.create_task(self._sync_missed(), name="cws-initial-sync")
 
     async def stop(self) -> None:
         self._running = False
