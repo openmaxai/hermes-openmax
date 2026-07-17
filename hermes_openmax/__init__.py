@@ -140,7 +140,7 @@ def register(ctx):
         allow_all_env="CWS_ALLOW_ALL_USERS",
         emoji="🏢",
         pii_safe=True,
-        max_message_length=8000,
+        max_message_length=3000,  # matches zylos splitMessage maxLen / FE expectations
         platform_hint=(
             "You are chatting inside an OpenMax workspace. Markdown is "
             "supported. Conversations may be DMs or group channels with "

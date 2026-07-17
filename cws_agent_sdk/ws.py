@@ -23,8 +23,12 @@ from .codec import (
     CLOSE_ORG_SUSPENDED,
     CLOSE_RATE_LIMITED,
     CLOSE_SESSION_EXPIRED,
+    FRAME_PING,
+    FRAME_PONG,
     Frame,
     decode_frame,
+    encode_ping,
+    encode_pong,
 )
 from .config import CwsConfig
 from .errors import CwsWsFatal
@@ -89,6 +93,15 @@ class CwsWsClient:
             raise ConnectionError("cws ws not connected")
         await self._conn.send(text)
 
+    async def _json_keepalive(self, conn) -> None:
+        """Client-initiated app-level JSON ping (zylos ws.js parity)."""
+        try:
+            while True:
+                await asyncio.sleep(self._cfg.ws_ping_interval_s)
+                await conn.send(encode_ping())
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            return
+
     # -- run loop ----------------------------------------------------------
 
     async def _run(self) -> None:
@@ -111,19 +124,33 @@ class CwsWsClient:
                     self._connected.set()
                     backoff = 1.0
                     self._log.log("connected")
+                    keepalive = asyncio.create_task(self._json_keepalive(conn))
                     if not first and self._on_reconnected:
                         await self._on_reconnected()
                     first = False
-                    async for raw in conn:
-                        frame = decode_frame(raw)
-                        if frame is None:
-                            continue
-                        try:
-                            await self._on_frame(frame)
-                        except Exception as exc:  # noqa: BLE001
-                            # Frame handler errors must not kill the socket;
-                            # undelivered messages are replayed via /sync.
-                            self._log.warn("frame handler error:", exc)
+                    try:
+                        async for raw in conn:
+                            frame = decode_frame(raw)
+                            if frame is None:
+                                continue
+                            if frame.type == FRAME_PING:
+                                # zylos parity: answer app-level JSON pings —
+                                # proxies may strip protocol ping/pong.
+                                try:
+                                    await conn.send(encode_pong())
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                continue
+                            if frame.type == FRAME_PONG:
+                                continue
+                            try:
+                                await self._on_frame(frame)
+                            except Exception as exc:  # noqa: BLE001
+                                # Frame handler errors must not kill the socket;
+                                # undelivered messages are replayed via /sync.
+                                self._log.warn("frame handler error:", exc)
+                    finally:
+                        keepalive.cancel()
             except ConnectionClosed as exc:
                 code = exc.code or 0
                 self._log.warn(f"closed code={code} reason={exc.reason!r}")

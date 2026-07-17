@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # Server->client frame types
+FRAME_PING = "ping"
+FRAME_PONG = "pong"
 FRAME_MESSAGE = "message"
 FRAME_MESSAGE_ACK = "message_ack"
 FRAME_TYPING = "typing"
@@ -61,6 +63,16 @@ def decode_frame(raw: str | bytes) -> Optional[Frame]:
         timestamp=int(obj.get("timestamp") or 0),
         raw=obj,
     )
+
+
+def encode_pong() -> str:
+    """Application-level JSON pong (zylos parity: some deployments front the
+    WS with proxies that drop protocol-level ping/pong)."""
+    return json.dumps({"type": FRAME_PONG, "timestamp": int(time.time() * 1000)})
+
+
+def encode_ping() -> str:
+    return json.dumps({"type": FRAME_PING, "timestamp": int(time.time() * 1000)})
 
 
 def encode_typing(conversation_id: str, user_id: str, action: str = "start") -> str:

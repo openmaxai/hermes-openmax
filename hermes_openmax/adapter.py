@@ -38,11 +38,18 @@ def _policy_from_env() -> AccessPolicyConfig:
         return raw in ("1", "true", "yes", "on")
 
     allow = [s.strip() for s in os.getenv("CWS_ALLOWED_USERS", "").split(",") if s.strip()]
+    dm_policy = os.getenv("CWS_DM_POLICY", "").strip().lower()
+    if dm_policy not in ("open", "allowlist", "owner"):
+        # Default open: CWS already scopes access to org members. Note this is
+        # intentionally looser than zylos's owner-private default — the
+        # platform can tighten it live via agent.config.dm_policy_changed.
+        dm_policy = "open" if flag("CWS_ALLOW_ALL_USERS", True) else "allowlist"
     return AccessPolicyConfig(
+        dm_policy=dm_policy,
         group_require_mention=flag("CWS_GROUP_REQUIRE_MENTION", True),
         allow_agent_senders=flag("CWS_ALLOW_AGENT_SENDERS", False),
         allow_sibling_dm=flag("CWS_ALLOW_SIBLING_DM", False),
-        dm_allowlist=[] if flag("CWS_ALLOW_ALL_USERS", True) else allow,
+        dm_allowlist=allow,
     )
 
 logger = logging.getLogger(__name__)
@@ -250,7 +257,16 @@ class CwsAdapter(BasePlatformAdapter):
                 **msg.metadata,
             },
             channel_prompt=self._orientation or None,
-            channel_context=msg.metadata.get("work_reference_context") or None,
+            channel_context="\n\n".join(
+                part
+                for part in (
+                    msg.metadata.get("group_context"),
+                    msg.metadata.get("work_reference_context"),
+                    msg.metadata.get("smart_mode_hint"),
+                )
+                if part
+            )
+            or None,
             raw_message=msg.raw,
         )
         await self.handle_message(event)

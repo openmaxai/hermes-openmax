@@ -193,3 +193,81 @@ async def test_ack_reaction_added_and_cleared_on_reply(tmp_path):
     await b.send("conv-1", "reply!")
     assert b.comm.reactions_removed == [("1", "eyes")]
     assert "conv-1" not in b._pending_acks
+
+
+@pytest.mark.asyncio
+async def test_group_smart_mode_and_history_context(tmp_path):
+    got = []
+
+    async def on_message(m):
+        got.append(m)
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.conv_type = "group"
+    b._group_mode_overrides["conv-1"] = "smart"
+    b.comm.messages["conv-1:1"] = detail(msg_id=1, seq=10, text="earlier chatter")
+    b.comm.messages["conv-1:2"] = detail(msg_id=2, seq=11, text="hello smart")
+    await b._handle_frame(msg_frame(msg_id=1, seq=10))
+    await b._handle_frame(msg_frame(msg_id=2, seq=11))
+    # smart mode: no mention required, both delivered, hint attached
+    assert len(got) == 2
+    assert "smart-mode" in got[1].metadata.get("smart_mode_hint", "")
+    assert "earlier chatter" in got[1].metadata.get("group_context", "")
+
+
+@pytest.mark.asyncio
+async def test_group_silent_mode_drops(tmp_path):
+    got = []
+
+    async def on_message(m):
+        got.append(m)
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.conv_type = "group"
+    b._group_mode_overrides["conv-1"] = "silent"
+    b.comm.messages["conv-1:1"] = detail()
+    await b._handle_frame(msg_frame())
+    assert got == []
+    assert b.comm.sync_acks == [10]  # consumed silently
+
+
+@pytest.mark.asyncio
+async def test_dm_reject_notice_throttled(tmp_path):
+    async def on_message(m):
+        pass
+
+    b = make_bridge(tmp_path, on_message)
+    b._policy.dm_policy = "owner"
+    b.owner_member_id = "boss-1"
+    b.comm.sent = []
+
+    async def send_message(conv_id, text, **kw):
+        b.comm.sent.append(text)
+        from cws_agent_sdk.types import SendReceipt
+
+        return SendReceipt(message_id="n-1", conversation_id=conv_id)
+
+    b.comm.send_message = send_message
+    b.comm.messages["conv-1:1"] = detail(sender="stranger-1")
+    b.comm.messages["conv-1:2"] = detail(msg_id=2, seq=11, sender="stranger-1")
+    await b._handle_frame(msg_frame(sender="stranger-1"))
+    await b._handle_frame(msg_frame(msg_id=2, seq=11, sender="stranger-1"))
+    assert len(b.comm.sent) == 1  # one notice, throttled
+
+
+@pytest.mark.asyncio
+async def test_dedup_persistence_across_restart(tmp_path):
+    got = []
+
+    async def on_message(m):
+        got.append(m)
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.messages["conv-1:1"] = detail()
+    await b._handle_frame(msg_frame())
+    b._storage.write_json("dedup.json", list(b._seen.keys()))
+
+    b2 = make_bridge(tmp_path, on_message)
+    b2.comm.messages["conv-1:1"] = detail()
+    await b2._handle_frame(msg_frame())
+    assert len(got) == 1  # second bridge skips via persisted dedup

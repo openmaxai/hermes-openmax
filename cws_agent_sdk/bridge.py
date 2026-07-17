@@ -36,7 +36,25 @@ from .types import InboundMessage, SendReceipt
 from .ws import CwsWsClient
 
 _SYNC_SEQ_KEY = "sync_seq.json"
+_DEDUP_KEY = "dedup.json"
+_POLICY_KEY = "policy.json"
 _DEDUP_MAX = 2048
+_DEDUP_PERSIST_EVERY = 25
+_GROUP_HISTORY_LEN = 10
+_GROUP_CONTEXT_N = 5
+
+DM_REJECT_NOTICE = (
+    "你好,我暂时无法处理这条私信(访问策略限制)。请联系我的 owner 开通权限。"
+)
+
+SMART_MODE_HINT = (
+    "<smart-mode>You were not mentioned. Decide whether to respond. Do NOT "
+    "reply if: the message is unrelated to you, just casual chat, or doesn't "
+    "need your input. Only reply when: 1) someone asks a question you can "
+    "help with, 2) discussing technical topics you know well, 3) someone "
+    "clearly needs assistance. When uncertain, prefer NOT to reply. Reply "
+    "with exactly [SKIP] to stay silent.</smart-mode>"
+)
 
 
 class CwsBridge:
@@ -83,7 +101,6 @@ class CwsBridge:
         self._metrics_task: Optional[asyncio.Task] = None
         self._on_config_event = on_config_event
         self.owner_member_id: str = ""
-        self._group_mode_overrides: dict[str, str] = {}  # conv_id -> raw mode
         self._ack_reaction = ack_reaction
         self._ack_ttl_s = ack_reaction_ttl_s
         self._pending_acks: dict[str, str] = {}  # conv_id -> message_id with our ack on it
@@ -96,11 +113,19 @@ class CwsBridge:
             logger=self._log,
         )
         self._policy = policy or AccessPolicyConfig()
-        self._seen: "OrderedDict[str, None]" = OrderedDict()
+        self._group_mode_overrides: dict[str, str] = {}  # conv_id -> raw mode
+        self._load_policy_state()
+        self._seen: "OrderedDict[str, None]" = OrderedDict(
+            (k, None) for k in (storage.read_json(_DEDUP_KEY) or [])[-_DEDUP_MAX:]
+        )
+        self._marks_since_persist = 0
         self._inflight: set[str] = set()
         self._own_client_msg_ids: "OrderedDict[str, None]" = OrderedDict()
+        self._group_history: dict[str, list[str]] = {}  # conv_id -> recent "name: text"
+        self._last_reject_notice: dict[str, float] = {}
         self._conv_types: "OrderedDict[str, str]" = OrderedDict()  # conv_id -> dm|group|...
         self._member_names: "OrderedDict[str, str]" = OrderedDict()  # member_id -> display_name
+        self._participants: "OrderedDict[str, set]" = OrderedDict()  # conv_id -> display names seen
         self._sync_seq: int = int((storage.read_json(_SYNC_SEQ_KEY) or {}).get("seq", 0))
         self._running = False
 
@@ -121,6 +146,7 @@ class CwsBridge:
 
     async def stop(self) -> None:
         self._running = False
+        self._storage.write_json(_DEDUP_KEY, list(self._seen.keys()))
         if self._metrics_task:
             self._metrics_task.cancel()
             self._metrics_task = None
@@ -169,7 +195,7 @@ class CwsBridge:
         self._remember_own(cmid)
         receipt = await self.comm.send_message(
             conversation_id,
-            content,
+            self._canonicalize_mentions(conversation_id, content),
             reply_to=reply_to,
             metadata=metadata,
             client_msg_id=cmid,
@@ -275,10 +301,19 @@ class CwsBridge:
                 self._policy.dm_allowlist = [
                     i for i in self._policy.dm_allowlist if i not in ids
                 ]
+            elif action == "set":
+                self._policy.dm_allowlist = ids
+            self._save_policy_state()
+        elif event == "agent.config.dm_policy_changed":
+            policy = str(data.get("policy", "")).lower()
+            if policy in ("open", "allowlist", "owner"):
+                self._policy.dm_policy = policy
+                self._save_policy_state()
         elif event == "agent.config.group_mode_changed":
             conv = str(data.get("conversation_id", ""))
             if conv:
                 self._group_mode_overrides[conv] = str(data.get("mode", ""))
+                self._save_policy_state()
         elif event == "agent.config.owner_changed":
             self.owner_member_id = str(data.get("new_owner_member_id", ""))
         # Other events (dm_policy / group_scope / group_allowlist / allowfrom)
@@ -323,6 +358,18 @@ class CwsBridge:
                 msg.metadata["conversation_name"] = conv_info["name"]
             if not msg.sender_name and msg.sender_id:
                 msg.sender_name = await self._member_name(msg.sender_id)
+            if msg.sender_name:
+                self._record_participant(conversation_id, msg.sender_name)
+            is_group = msg.conversation_type not in ("dm",)
+            if is_group:
+                # zylos group-history parity: record EVERY group message
+                # (handled or not) so later turns get conversation context.
+                self._record_group_history(conversation_id, msg)
+            mode = self._group_mode_overrides.get(conversation_id, "").lower()
+            if is_group and mode == "silent":
+                self._mark_seen(key)
+                await self._advance(conversation_id, msg.seq or seq)
+                return
             await self._hydrate_media(msg)
             await self._expand_work_references(msg)
             await self._hydrate_reply_context(msg)
@@ -330,7 +377,19 @@ class CwsBridge:
                 msg,
                 self_member_id=self._cfg.member_id,
                 cfg=self._effective_policy(conversation_id),
+                owner_member_id=self.owner_member_id,
             )
+            if decision.handle and is_group:
+                history = self._group_history.get(conversation_id, [])
+                recent = [h for h in history[:-1]][-_GROUP_CONTEXT_N:]
+                if recent:
+                    msg.metadata["group_context"] = (
+                        "<group-context>\n" + "\n".join(recent) + "\n</group-context>"
+                    )
+                from .access_policy import _is_mentioned
+
+                if mode == "smart" and not _is_mentioned(msg, self._cfg.member_id):
+                    msg.metadata["smart_mode_hint"] = SMART_MODE_HINT
             if decision.handle and self._billing is not None and await self._billing.is_suspended():
                 self._log.warn("billing suspended — skipping delivery", conversation_id)
                 if self._billing.should_send_overdue_notice(conversation_id):
@@ -343,6 +402,7 @@ class CwsBridge:
                 return
             if not decision.handle:
                 self._log.log(f"policy skip [{decision.reason}] conv={conversation_id} msg={message_id}")
+                await self._maybe_send_reject_notice(conversation_id, msg, decision.reason)
                 self._mark_seen(key)
                 await self._advance(conversation_id, msg.seq or seq)
                 return
@@ -396,7 +456,13 @@ class CwsBridge:
         mentions = m.get("mentions") or []
         extra_meta = dict(m.get("metadata") or {})
         priority = m.get("priority")
-        if priority is not None:
+        # zylos system-message.js parity: system events carry priority under
+        # metadata.systemEvent.priority as urgent/high/normal.
+        sys_event = extra_meta.get("systemEvent") or {}
+        sys_prio = str(sys_event.get("priority", "")).lower() if isinstance(sys_event, dict) else ""
+        if sys_prio in ("urgent", "high", "normal"):
+            extra_meta["cws_priority"] = {"urgent": 1, "high": 2, "normal": 3}[sys_prio]
+        elif priority is not None:
             extra_meta["cws_priority"] = int(priority)  # 1=urgent 2=high 3=normal
         return InboundMessage(
             mentions=[mm for mm in mentions if isinstance(mm, dict)],
@@ -445,49 +511,50 @@ class CwsBridge:
             self._member_names.popitem(last=False)
         return name
 
-    async def _hydrate_media(self, msg: InboundMessage) -> None:
-        """Best-effort: resolve message attachments to local files for vision.
-
-        Attachment shapes vary; we look for artifact URI strings, resolve them
-        to presigned URLs, and download into the storage dir. Failures leave
-        msg.media entries without a local path — never break delivery."""
-        m = (msg.raw or {}).get("message") if isinstance(msg.raw, dict) else None
-        attachments = (m or {}).get("attachments") or []
-        if not attachments:
-            return
+    async def _download_attachments(self, message_dict: dict) -> list[dict]:
+        """Resolve+download a message's attachments; returns media entries.
+        Best-effort — failures return entries without a local path."""
+        attachments = (message_dict or {}).get("attachments") or []
         uris = []
         for att in attachments:
             if isinstance(att, str):
                 uris.append(att)
             elif isinstance(att, dict):
-                uri = att.get("uri") or att.get("artifact_uri") or att.get("url")
+                uri = att.get("uri") or att.get("artifact_uri") or att.get("url") or (
+                    f"artifact://{att['artifact_id']}" if att.get("artifact_id") else ""
+                )
                 if isinstance(uri, str) and uri:
                     uris.append(uri)
         if not uris:
-            return
+            return []
         try:
             resolved = await self.artifacts.resolve_uris(uris[:10])
         except Exception as exc:  # noqa: BLE001 — media is best-effort
             self._log.warn("attachment resolve failed:", exc)
-            return
+            return []
         import httpx as _httpx
 
+        entries: list[dict] = []
         for uri, info in (resolved.get("resolved") or {}).items():
             url = info.get("download_url")
-            if not url:
-                continue
             entry = {"uri": uri, "type": info.get("content_type", ""), "name": info.get("name", "")}
-            try:
-                fname = f"media-{abs(hash(uri)) % 10**10}-{(info.get('name') or 'file')[-60:]}"
-                async with _httpx.AsyncClient(timeout=60) as dl:
-                    resp = await dl.get(url)
-                    resp.raise_for_status()
-                    self._storage.write(f"media/{fname}", resp.content)
-                    if hasattr(self._storage, "path_for"):
-                        entry["path"] = self._storage.path_for(f"media/{fname}")
-            except Exception as exc:  # noqa: BLE001 — download is best-effort
-                self._log.warn("attachment download failed:", exc)
-            msg.media.append(entry)
+            if url:
+                try:
+                    fname = f"media-{abs(hash(uri)) % 10**10}-{(info.get('name') or 'file')[-60:]}"
+                    async with _httpx.AsyncClient(timeout=60) as dl:
+                        resp = await dl.get(url)
+                        resp.raise_for_status()
+                        self._storage.write(f"media/{fname}", resp.content)
+                        if hasattr(self._storage, "path_for"):
+                            entry["path"] = self._storage.path_for(f"media/{fname}")
+                except Exception as exc:  # noqa: BLE001 — download is best-effort
+                    self._log.warn("attachment download failed:", exc)
+            entries.append(entry)
+        return entries
+
+    async def _hydrate_media(self, msg: InboundMessage) -> None:
+        m = (msg.raw or {}).get("message") if isinstance(msg.raw, dict) else None
+        msg.media.extend(await self._download_attachments(m or {}))
 
     async def _expand_work_references(self, msg: InboundMessage) -> None:
         """Expand proj://<id> / issue://<id> URIs in the message into context.
@@ -534,6 +601,17 @@ class CwsBridge:
             msg.metadata["reply_to_author_id"] = author_id
             if author_id:
                 msg.metadata["reply_to_author_name"] = await self._member_name(author_id)
+            # zylos parity: quoted media is downloaded too, so the agent can
+            # actually see the image being replied to.
+            quoted_media = await self._download_attachments(parent)
+            if quoted_media:
+                msg.media.extend(quoted_media)
+                if not text:
+                    labels = ", ".join(
+                        f"[{'image' if 'image' in (e.get('type') or '') else 'file'}: {e.get('name','')}]"
+                        for e in quoted_media
+                    )
+                    msg.metadata["reply_to_text"] = labels
         except Exception as exc:  # noqa: BLE001 — quote context is best-effort
             self._log.warn("reply-context hydrate failed:", exc)
 
@@ -545,6 +623,9 @@ class CwsBridge:
         from dataclasses import replace
 
         low = mode.lower()
+        if "smart" in low:
+            # smart: receive everything, model decides ([SKIP] to stay silent).
+            return replace(self._policy, group_require_mention=False)
         if "mention" in low:
             return replace(self._policy, group_require_mention=True)
         if low in ("open", "all") or "open" in low:
@@ -612,12 +693,90 @@ class CwsBridge:
             if cursor <= 0:
                 return
 
+    def _record_group_history(self, conversation_id: str, msg: InboundMessage) -> None:
+        hist = self._group_history.setdefault(conversation_id, [])
+        label = msg.sender_name or msg.sender_id[:8]
+        text = msg.text or "[media]"
+        hist.append(f"{label}: {text[:300]}")
+        del hist[:-_GROUP_HISTORY_LEN]
+
+    async def _maybe_send_reject_notice(
+        self, conversation_id: str, msg: InboundMessage, reason: str
+    ) -> None:
+        """zylos parity: polite rejection for human DMs blocked by policy —
+        throttled, never for agents/system, never for group-no-mention."""
+        if reason not in ("dm_owner_only", "dm_not_allowlisted"):
+            return
+        if msg.sender_type != "human":
+            return
+        import time as _time
+
+        now = _time.time()
+        if now - self._last_reject_notice.get(conversation_id, 0) < 3600:
+            return
+        self._last_reject_notice[conversation_id] = now
+        try:
+            await self.comm.send_message(conversation_id, DM_REJECT_NOTICE)
+        except Exception as exc:  # noqa: BLE001 — notice is best-effort
+            self._log.warn("reject notice failed:", exc)
+
+    # -- policy state persistence (zylos config.json parity) --------------------
+
+    def _load_policy_state(self) -> None:
+        saved = self._storage.read_json(_POLICY_KEY)
+        if not isinstance(saved, dict):
+            return
+        if saved.get("dm_policy"):
+            self._policy.dm_policy = str(saved["dm_policy"])
+        if isinstance(saved.get("dm_allowlist"), list):
+            self._policy.dm_allowlist = [str(i) for i in saved["dm_allowlist"]]
+        if isinstance(saved.get("group_modes"), dict):
+            self._group_mode_overrides.update(
+                {str(k): str(v) for k, v in saved["group_modes"].items()}
+            )
+
+    def _save_policy_state(self) -> None:
+        self._storage.write_json(
+            _POLICY_KEY,
+            {
+                "dm_policy": self._policy.dm_policy,
+                "dm_allowlist": self._policy.dm_allowlist,
+                "group_modes": self._group_mode_overrides,
+            },
+        )
+
+    # -- outbound mention canonicalization (zylos mention.js parity) -----------
+
+    def _record_participant(self, conversation_id: str, name: str) -> None:
+        names = self._participants.setdefault(conversation_id, set())
+        names.add(name)
+        while len(self._participants) > 512:
+            self._participants.popitem(last=False)
+
+    def _canonicalize_mentions(self, conversation_id: str, text: str) -> str:
+        """Rewrite @name to the participant's exact display_name (longest-first,
+        case-insensitive) so the FE's participant-name matcher highlights it."""
+        if not text or "@" not in text:
+            return text
+        import re
+
+        names = sorted(self._participants.get(conversation_id, ()), key=len, reverse=True)
+        for name in names:
+            text = re.sub("@" + re.escape(name), "@" + name, text, flags=re.IGNORECASE)
+        return text
+
     # -- small state helpers ---------------------------------------------------
 
     def _mark_seen(self, key: str) -> None:
         self._seen[key] = None
         while len(self._seen) > _DEDUP_MAX:
             self._seen.popitem(last=False)
+        # zylos parity: persist dedup across restarts so the /sync window
+        # boundary can't double-deliver after a crash.
+        self._marks_since_persist += 1
+        if self._marks_since_persist >= _DEDUP_PERSIST_EVERY:
+            self._marks_since_persist = 0
+            self._storage.write_json(_DEDUP_KEY, list(self._seen.keys()))
 
     def _remember_own(self, client_msg_id: str) -> None:
         self._own_client_msg_ids[client_msg_id] = None

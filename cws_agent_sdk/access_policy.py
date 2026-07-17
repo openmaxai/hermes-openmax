@@ -21,10 +21,13 @@ from .types import InboundMessage
 
 @dataclass
 class AccessPolicyConfig:
+    # DM admission: "open" (any org member), "allowlist" (dm_allowlist +
+    # owner), "owner" (bound owner only — zylos's default private model).
+    dm_policy: str = "open"
     group_require_mention: bool = True
     allow_agent_senders: bool = False  # let other agents' messages trigger us
     allow_sibling_dm: bool = False  # same-owner agent DMs
-    dm_allowlist: list[str] = field(default_factory=list)  # member_ids; empty = allow all
+    dm_allowlist: list[str] = field(default_factory=list)  # member_ids (dm_policy=allowlist)
     # System Member DMs (scheduler "dependencies ready", issue.activated, ...)
     # DRIVE the task flow — zylos lets them straight through. Default True.
     handle_system: bool = True
@@ -52,9 +55,11 @@ def decide_inbound(
     self_member_id: str,
     conversation_type: Optional[str] = None,
     cfg: Optional[AccessPolicyConfig] = None,
+    owner_member_id: str = "",
 ) -> AccessDecision:
     cfg = cfg or AccessPolicyConfig()
     conv_type = (conversation_type or msg.conversation_type or "dm").lower()
+    is_owner = bool(owner_member_id and msg.sender_id == owner_member_id)
 
     if self_member_id and msg.sender_id == self_member_id:
         return AccessDecision(False, "own_message")
@@ -75,13 +80,23 @@ def decide_inbound(
 
     # Human sender.
     if conv_type == "dm":
-        if cfg.dm_allowlist and msg.sender_id not in cfg.dm_allowlist:
+        if is_owner:
+            return AccessDecision(True, "dm_owner")  # owner always exempt
+        policy = (cfg.dm_policy or "open").lower()
+        if policy == "owner":
+            return AccessDecision(False, "dm_owner_only")
+        if policy == "allowlist":
+            if msg.sender_id in cfg.dm_allowlist:
+                return AccessDecision(True, "dm_allowlisted")
             return AccessDecision(False, "dm_not_allowlisted")
         return AccessDecision(True, "dm")
 
     # Group / broadcast / bridge conversations.
+    mentioned = _is_mentioned(msg, self_member_id)
+    if is_owner and mentioned:
+        return AccessDecision(True, "group_owner_mention")  # owner @-bypass
     if not cfg.group_require_mention:
         return AccessDecision(True, "group_open")
-    if _is_mentioned(msg, self_member_id):
+    if mentioned:
         return AccessDecision(True, "group_mention")
     return AccessDecision(False, "group_no_mention")

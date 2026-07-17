@@ -23,9 +23,30 @@ def test_human_dm_handled():
 
 
 def test_dm_allowlist_blocks_stranger():
-    cfg = AccessPolicyConfig(dm_allowlist=["owner-1"])
+    cfg = AccessPolicyConfig(dm_policy="allowlist", dm_allowlist=["owner-1"])
     assert not decide_inbound(msg(sender_id="u-7"), self_member_id=ME, cfg=cfg).handle
     assert decide_inbound(msg(sender_id="owner-1"), self_member_id=ME, cfg=cfg).handle
+
+
+def test_dm_owner_policy_and_exemption():
+    cfg = AccessPolicyConfig(dm_policy="owner")
+    d = decide_inbound(msg(sender_id="u-7"), self_member_id=ME, cfg=cfg)
+    assert not d.handle and d.reason == "dm_owner_only"
+    d = decide_inbound(msg(sender_id="boss-1"), self_member_id=ME, cfg=cfg,
+                       owner_member_id="boss-1")
+    assert d.handle and d.reason == "dm_owner"
+    # owner also bypasses allowlist
+    cfg2 = AccessPolicyConfig(dm_policy="allowlist", dm_allowlist=[])
+    assert decide_inbound(msg(sender_id="boss-1"), self_member_id=ME, cfg=cfg2,
+                          owner_member_id="boss-1").handle
+
+
+def test_group_owner_mention_bypass():
+    cfg = AccessPolicyConfig(group_require_mention=True)
+    m = msg(sender_id="boss-1", conv_type="group",
+            mentions=[{"type": "member", "member_id": ME}])
+    d = decide_inbound(m, self_member_id=ME, cfg=cfg, owner_member_id="boss-1")
+    assert d.handle and d.reason == "group_owner_mention"
 
 
 def test_group_requires_mention_by_default():
