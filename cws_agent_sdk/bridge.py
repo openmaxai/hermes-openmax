@@ -56,6 +56,7 @@ class CwsBridge:
             logger=self._log,
         )
         self._seen: "OrderedDict[str, None]" = OrderedDict()
+        self._inflight: set[str] = set()
         self._own_client_msg_ids: "OrderedDict[str, None]" = OrderedDict()
         self._sync_seq: int = int((storage.read_json(_SYNC_SEQ_KEY) or {}).get("seq", 0))
         self._running = False
@@ -143,18 +144,24 @@ class CwsBridge:
         self, conversation_id: str, message_id, seq: int, frame: Optional[Frame] = None
     ) -> None:
         key = f"{conversation_id}:{message_id}"
-        if key in self._seen:
+        # The in-flight guard closes the WS-frame vs /sync-replay race: both
+        # can observe the same undelivered message concurrently.
+        if key in self._seen or key in self._inflight:
             return
-        detail = await self.comm.get_message(conversation_id, message_id)
-        msg = self._normalize(detail, conversation_id, seq)
-        if msg is None:
+        self._inflight.add(key)
+        try:
+            detail = await self.comm.get_message(conversation_id, message_id)
+            msg = self._normalize(detail, conversation_id, seq)
+            if msg is None:
+                self._mark_seen(key)
+                await self._advance(conversation_id, seq)
+                return
+            # Delivery point — exceptions propagate, watermark stays put, /sync replays.
+            await self._on_message(msg)
             self._mark_seen(key)
-            await self._advance(conversation_id, seq)
-            return
-        # Delivery point — exceptions propagate, watermark stays put, /sync replays.
-        await self._on_message(msg)
-        self._mark_seen(key)
-        await self._advance(conversation_id, msg.seq or seq)
+            await self._advance(conversation_id, msg.seq or seq)
+        finally:
+            self._inflight.discard(key)
 
     def _normalize(
         self, detail: dict, conversation_id: str, seq: int

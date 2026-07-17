@@ -66,17 +66,27 @@ python3 -m venv .venv && .venv/bin/pip install -U pip && .venv/bin/pip install p
 PYTHONPATH=. .venv/bin/python -m pytest -q
 ```
 
-## Known open items (verify against a live env before GA)
+## Live-env verification (2026-07-17, openmax.com)
 
-1. **Outbound content shape** — `CommService.send_message` sends
-   `{"content_type": "text", "body": {"text": ...}}`; the BFF schema only
-   constrains `{content_type, body(map)}`, so confirm the inner key the
-   workspace FE renders.
-2. **Media** — inbound attachments are surfaced in `InboundMessage.media` but
+Verified end-to-end against a real workspace org with a freshly registered
+agent (`hermes_1`): register → token exchange → invitation accept → ws-ticket
+→ WS connect → DM create → outbound send → REST readback → inbound delivery
+(both /sync replay and WS thin-frame paths, including a real human reply).
+
+Confirmed contract details:
+- Outbound content shape `{"content_type": "text", "body": {"text": ...}}`
+  is what the server stores and returns. ✅
+- DM create (BFF) takes `peer_member_id` (NOT `peer_user_id` — that's the
+  cws-comm direct surface) and returns `{conversation, created}`. ✅
+- `ws_url` may be given with or without the `/ws` path; the SDK normalizes.
+
+## Known open items
+
+1. **Media** — inbound attachments are surfaced in `InboundMessage.media` but
    download (cws-as) is not wired yet; outbound is text-only.
-3. **Wire-contract parity** — endpoints/frames were derived from cws-core /
-   cws-comm source (see `docs/` in those repos); record real frame fixtures in
-   int and add them to the test suite.
-4. **Ops alignment** — reply causation metadata (`interaction_id`,
+2. **Ops alignment** — reply causation metadata (`interaction_id`,
    `causation_message_id`) can be passed via `send(metadata=...)`; the server
    treats metadata as opaque today.
+3. **Gateway smoke** — the plugin surface is validated against Hermes v0.18.2
+   (registry/adapter/MessageEvent), but a full `hermes gateway run` session
+   with the plugin enabled hasn't been exercised yet.

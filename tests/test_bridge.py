@@ -136,3 +136,24 @@ async def test_fallback_text_extraction(tmp_path):
     b.comm.messages["conv-1:1"] = d
     await b._handle_frame(msg_frame())
     assert got[0].text == "fallback!"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_delivery_suppressed(tmp_path):
+    """WS frame and /sync replay racing on the same message deliver once."""
+    import asyncio
+
+    got = []
+
+    async def slow_on_message(m):
+        await asyncio.sleep(0.05)  # widen the race window
+        got.append(m)
+
+    b = make_bridge(tmp_path, slow_on_message)
+    b.comm.messages["conv-1:1"] = detail()
+    await asyncio.gather(
+        b._handle_frame(msg_frame()),
+        b._handle_frame(msg_frame()),
+    )
+    assert len(got) == 1
+    assert b.comm.sync_acks == [10]

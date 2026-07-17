@@ -97,7 +97,10 @@ class CwsWsClient:
         while not self._stopping:
             try:
                 ticket = await self._ticket_provider()
-                url = f"{self._cfg.ws_url}/ws?ticket={ticket}&device_id={self._cfg.device_id}"
+                base = self._cfg.ws_url.rstrip("/")
+                if not base.endswith("/ws"):
+                    base = f"{base}/ws"  # accept ws_url given with or without the /ws path
+                url = f"{base}?ticket={ticket}&device_id={self._cfg.device_id}"
                 async with websockets.connect(
                     url,
                     ping_interval=self._cfg.ws_ping_interval_s,

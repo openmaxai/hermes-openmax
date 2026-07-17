@@ -103,3 +103,9 @@ class CommService:
 
     async def get_conversation(self, conversation_id: str) -> dict:
         return await self._http.get(f"/api/v1/conversations/{conversation_id}")
+
+    async def create_dm(self, peer_member_id: str) -> dict:
+        """Get-or-create the DM with another member (idempotent per pair)."""
+        return await self._http.post(
+            "/api/v1/conversations/dm", json={"peer_member_id": peer_member_id}
+        )
