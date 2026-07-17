@@ -115,6 +115,14 @@ class CommService:
             raw=data,
         )
 
+    async def edit_message(self, message_id: str | int, text: str) -> dict:
+        """Replace own message content (15-min server-side edit window)."""
+        return await self._http.request(
+            "PUT",
+            f"/api/v1/messages/{message_id}",
+            json={"content": {"content_type": "text", "body": {"text": text}}},
+        )
+
     # -- reactions ---------------------------------------------------------
 
     async def add_reaction(self, message_id: str | int, reaction_code: str) -> None:

@@ -66,8 +66,11 @@ def test_agent_group_blocked_even_with_mention_unless_allowed():
     assert decide_inbound(m, self_member_id=ME, cfg=cfg).handle
 
 
-def test_system_sender_skipped_by_default():
-    assert not decide_inbound(msg(sender_type="system"), self_member_id=ME).handle
+def test_system_sender_delivered_by_default():
+    # Scheduler DMs drive the task flow (dependency-ready, issue.activated).
+    assert decide_inbound(msg(sender_type="system"), self_member_id=ME).handle
+    cfg = AccessPolicyConfig(handle_system=False)
+    assert not decide_inbound(msg(sender_type="system"), self_member_id=ME, cfg=cfg).handle
 
 
 def test_own_message_never_handled():

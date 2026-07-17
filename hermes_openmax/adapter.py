@@ -116,11 +116,18 @@ class CwsAdapter(BasePlatformAdapter):
                 f"{me.get('member_id')}) in org '{me.get('org_name')}' ({me.get('org_slug')}). "
                 f"Your responsible human owner is '{owner_name or 'unknown'}'"
                 f"{f' (member_id {owner_id})' if owner_id else ''}.\n"
-                "You have native workspace tools: workspace_tasks (projects/issues/tasks), "
-                "workspace_kb (knowledge base), workspace_members (directory, DMs). Use them "
-                "for any request about workspace work items or knowledge instead of guessing.\n"
-                "Etiquette: reply in the conversation's language; in group conversations you "
-                "only see messages that mention you; keep replies concise and actionable."
+                "You have native workspace tools: workspace_tasks (projects/issues/tasks/"
+                "comments/blueprints/attempts), workspace_kb, workspace_comm (proactive "
+                "messaging), workspace_artifacts, workspace_members. Use them for any "
+                "workspace request instead of guessing; never use built-in todo tools for "
+                "workspace tasks.\n"
+                "IMPORTANT: before handling any TASK-shaped message (a work goal, not simple "
+                "Q&A), load the work discipline via skill_view('hermes-openmax:workspace') "
+                "and follow it (register Issue→Blueprint→Task before working; confirm "
+                "project+KB with the user; owner acceptance closes the loop).\n"
+                "System Member DMs (scheduler) drive the task flow: act on them in the "
+                "referenced Issue/Task context, never reply to them. In group smart-mode, "
+                "reply exactly [SKIP] to stay silent. Reply in the conversation's language."
             )
             logger.info("[cws] orientation built (%d chars)", len(self._orientation))
         except Exception as exc:  # noqa: BLE001 — orientation is an enhancement
@@ -147,6 +154,11 @@ class CwsAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._bridge:
             return SendResult(success=False, error="cws bridge not connected")
+        # zylos parity: a bare [SKIP] reply means "intentionally stay silent"
+        # (e.g. group smart-mode judged the message not worth answering).
+        if content.strip().upper() == "[SKIP]":
+            logger.info("[cws] reply intentionally skipped for %s", chat_id)
+            return SendResult(success=True, message_id="")
         try:
             receipt = await self._bridge.send(
                 conversation_id=chat_id,
@@ -165,6 +177,25 @@ class CwsAdapter(BasePlatformAdapter):
                 await self._bridge.send_typing(chat_id)
             except Exception:  # noqa: BLE001 — typing is best-effort
                 pass
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Own-message edit within cws-comm's 15-min window (enables Hermes
+        streaming-style progressive replies)."""
+        if not self._bridge:
+            return SendResult(success=False, error="cws bridge not connected")
+        try:
+            await self._bridge.comm.edit_message(message_id, content)
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:  # noqa: BLE001 — caller falls back to a new send
+            logger.warning("[cws] edit_message failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         if not self._bridge:

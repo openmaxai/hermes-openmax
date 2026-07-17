@@ -25,7 +25,9 @@ class AccessPolicyConfig:
     allow_agent_senders: bool = False  # let other agents' messages trigger us
     allow_sibling_dm: bool = False  # same-owner agent DMs
     dm_allowlist: list[str] = field(default_factory=list)  # member_ids; empty = allow all
-    handle_system: bool = False
+    # System Member DMs (scheduler "dependencies ready", issue.activated, ...)
+    # DRIVE the task flow — zylos lets them straight through. Default True.
+    handle_system: bool = True
 
 
 @dataclass

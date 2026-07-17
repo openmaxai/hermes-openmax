@@ -389,6 +389,10 @@ class CwsBridge:
             return None
         text = self._extract_text(m, content)
         mentions = m.get("mentions") or []
+        extra_meta = dict(m.get("metadata") or {})
+        priority = m.get("priority")
+        if priority is not None:
+            extra_meta["cws_priority"] = int(priority)  # 1=urgent 2=high 3=normal
         return InboundMessage(
             mentions=[mm for mm in mentions if isinstance(mm, dict)],
             message_id=str(m.get("id", "")),
@@ -400,7 +404,7 @@ class CwsBridge:
             seq=int(m.get("seq") or seq or 0),
             reply_to_message_id=str(m["parent_id"]) if m.get("parent_id") else None,
             created_at=m.get("created_at") or m.get("timestamp"),
-            metadata=m.get("metadata") or {},
+            metadata=extra_meta,
             raw=detail,
         )
 
