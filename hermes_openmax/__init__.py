@@ -62,6 +62,17 @@ def _env_enablement():
 def register(ctx):
     """Hermes plugin entry point."""
     from .adapter import CwsAdapter
+    from .tools import ALL_TOOLS
+
+    for name, schema, handler, emoji in ALL_TOOLS:
+        ctx.register_tool(
+            name=name,
+            toolset="workspace",
+            schema=schema,
+            handler=handler,
+            check_fn=is_connected,
+            emoji=emoji,
+        )
 
     ctx.register_platform(
         name="cws",
@@ -78,6 +89,7 @@ def register(ctx):
         allow_all_env="CWS_ALLOW_ALL_USERS",
         emoji="🏢",
         pii_safe=True,
+        max_message_length=8000,
         platform_hint=(
             "You are chatting inside an OpenMax workspace. Markdown is "
             "supported. Conversations may be DMs or group channels with "

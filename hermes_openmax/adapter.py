@@ -70,6 +70,7 @@ class CwsAdapter(BasePlatformAdapter):
 
         super().__init__(config=config, platform=Platform("cws"))
         self._bridge: Optional[CwsBridge] = None
+        self._orientation: str = ""
         CwsAdapter._last_instance = self
 
     # -- lifecycle -----------------------------------------------------
@@ -91,7 +92,35 @@ class CwsAdapter(BasePlatformAdapter):
         )
         await self._bridge.start()
         logger.info("[cws] bridge started (org=%s)", cfg.org_id or "<from-token>")
+        await self._build_orientation()
         return True
+
+    async def _build_orientation(self) -> None:
+        """Workspace orientation injected per-turn (zylos-openmax parity:
+        the agent should know who it is in this org, who its owner is, and
+        what workspace capabilities it has)."""
+        try:
+            me = await self._bridge.core.me()
+            owner_name = ""
+            owner_id = self._bridge.owner_member_id
+            if owner_id:
+                owner = await self._bridge.core.get_member(owner_id)
+                owner_name = str(owner.get("display_name") or "")
+            self._orientation = (
+                "# OpenMax Workspace context\n"
+                f"You are workspace member '{me.get('display_name')}' (agent, member_id "
+                f"{me.get('member_id')}) in org '{me.get('org_name')}' ({me.get('org_slug')}). "
+                f"Your responsible human owner is '{owner_name or 'unknown'}'"
+                f"{f' (member_id {owner_id})' if owner_id else ''}.\n"
+                "You have native workspace tools: workspace_tasks (projects/issues/tasks), "
+                "workspace_kb (knowledge base), workspace_members (directory, DMs). Use them "
+                "for any request about workspace work items or knowledge instead of guessing.\n"
+                "Etiquette: reply in the conversation's language; in group conversations you "
+                "only see messages that mention you; keep replies concise and actionable."
+            )
+            logger.info("[cws] orientation built (%d chars)", len(self._orientation))
+        except Exception as exc:  # noqa: BLE001 — orientation is an enhancement
+            logger.warning("[cws] orientation build failed: %s", exc)
 
     async def disconnect(self) -> None:
         if self._bridge:
@@ -168,6 +197,62 @@ class CwsAdapter(BasePlatformAdapter):
                 "cws_seq": msg.seq,
                 **msg.metadata,
             },
+            channel_prompt=self._orientation or None,
             raw_message=msg.raw,
         )
         await self.handle_message(event)
+
+    # -- outbound media -------------------------------------------------------
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Upload a local image via the presigned two-phase flow, then send a
+        message referencing it. Falls back to a caption+URL text message."""
+        import os
+
+        import httpx
+
+        if not self._bridge:
+            return SendResult(success=False, error="cws bridge not connected")
+        try:
+            if os.path.isfile(image_url):
+                size = os.path.getsize(image_url)
+                fname = os.path.basename(image_url)
+                ctype = "image/png" if fname.lower().endswith(".png") else "image/jpeg"
+                prep = await self._bridge.artifacts.prepare_conversation_upload(
+                    chat_id, fname, ctype, size
+                )
+                if not prep.get("instant_upload"):
+                    with open(image_url, "rb") as fh:
+                        async with httpx.AsyncClient(timeout=120) as up:
+                            resp = await up.put(
+                                prep["upload_url"], content=fh.read(),
+                                headers=prep.get("headers") or {},
+                            )
+                            resp.raise_for_status()
+                node = await self._bridge.artifacts.finalize_conversation_upload(
+                    prep["upload_token"]
+                )
+                text = caption or f"[image] {fname}"
+                receipt = await self._bridge.send(chat_id, text, reply_to=reply_to,
+                                                  metadata={"attachment": node})
+                return SendResult(success=True, message_id=receipt.message_id)
+            # Remote URL: no re-hosting — send as markdown image link.
+            text = f"![{caption or 'image'}]({image_url})"
+            receipt = await self._bridge.send(chat_id, text, reply_to=reply_to)
+            return SendResult(success=True, message_id=receipt.message_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[cws] send_image failed, falling back to text: %s", exc)
+            try:
+                receipt = await self._bridge.send(
+                    chat_id, f"{caption or ''} {image_url}".strip(), reply_to=reply_to
+                )
+                return SendResult(success=True, message_id=receipt.message_id)
+            except Exception as exc2:  # noqa: BLE001
+                return SendResult(success=False, error=str(exc2))

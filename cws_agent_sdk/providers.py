@@ -59,6 +59,10 @@ class FileStorage:
         except FileNotFoundError:
             pass
 
+    def path_for(self, key: str) -> str:
+        """Real filesystem path for a key (e.g. downloaded media for vision)."""
+        return str(self._path(key))
+
     # JSON convenience wrappers used across the SDK.
     def read_json(self, key: str) -> Optional[Any]:
         raw = self.read(key)

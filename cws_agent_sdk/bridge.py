@@ -95,6 +95,7 @@ class CwsBridge:
         self._inflight: set[str] = set()
         self._own_client_msg_ids: "OrderedDict[str, None]" = OrderedDict()
         self._conv_types: "OrderedDict[str, str]" = OrderedDict()  # conv_id -> dm|group|...
+        self._member_names: "OrderedDict[str, str]" = OrderedDict()  # member_id -> display_name
         self._sync_seq: int = int((storage.read_json(_SYNC_SEQ_KEY) or {}).get("seq", 0))
         self._running = False
 
@@ -257,6 +258,9 @@ class CwsBridge:
                 await self._advance(conversation_id, seq)
                 return
             msg.conversation_type = await self._conversation_type(conversation_id)
+            if not msg.sender_name and msg.sender_id:
+                msg.sender_name = await self._member_name(msg.sender_id)
+            await self._hydrate_media(msg)
             decision = decide_inbound(
                 msg,
                 self_member_id=self._cfg.member_id,
@@ -328,6 +332,65 @@ class CwsBridge:
         if isinstance(m.get("content"), str):
             return m["content"]
         return ""
+
+    async def _member_name(self, member_id: str) -> str:
+        cached = self._member_names.get(member_id)
+        if cached is not None:
+            return cached
+        name = ""
+        try:
+            member = await self.core.get_member(member_id)
+            name = str(member.get("display_name") or "")
+        except Exception:  # noqa: BLE001 — name lookup must never break delivery
+            pass
+        self._member_names[member_id] = name
+        while len(self._member_names) > 1024:
+            self._member_names.popitem(last=False)
+        return name
+
+    async def _hydrate_media(self, msg: InboundMessage) -> None:
+        """Best-effort: resolve message attachments to local files for vision.
+
+        Attachment shapes vary; we look for artifact URI strings, resolve them
+        to presigned URLs, and download into the storage dir. Failures leave
+        msg.media entries without a local path — never break delivery."""
+        m = (msg.raw or {}).get("message") if isinstance(msg.raw, dict) else None
+        attachments = (m or {}).get("attachments") or []
+        if not attachments:
+            return
+        uris = []
+        for att in attachments:
+            if isinstance(att, str):
+                uris.append(att)
+            elif isinstance(att, dict):
+                uri = att.get("uri") or att.get("artifact_uri") or att.get("url")
+                if isinstance(uri, str) and uri:
+                    uris.append(uri)
+        if not uris:
+            return
+        try:
+            resolved = await self.artifacts.resolve_uris(uris[:10])
+        except Exception as exc:  # noqa: BLE001 — media is best-effort
+            self._log.warn("attachment resolve failed:", exc)
+            return
+        import httpx as _httpx
+
+        for uri, info in (resolved.get("resolved") or {}).items():
+            url = info.get("download_url")
+            if not url:
+                continue
+            entry = {"uri": uri, "type": info.get("content_type", ""), "name": info.get("name", "")}
+            try:
+                fname = f"media-{abs(hash(uri)) % 10**10}-{(info.get('name') or 'file')[-60:]}"
+                async with _httpx.AsyncClient(timeout=60) as dl:
+                    resp = await dl.get(url)
+                    resp.raise_for_status()
+                    self._storage.write(f"media/{fname}", resp.content)
+                    if hasattr(self._storage, "path_for"):
+                        entry["path"] = self._storage.path_for(f"media/{fname}")
+            except Exception as exc:  # noqa: BLE001 — download is best-effort
+                self._log.warn("attachment download failed:", exc)
+            msg.media.append(entry)
 
     def _effective_policy(self, conversation_id: str) -> AccessPolicyConfig:
         """Apply a per-conversation group-mode override on top of the base policy."""
