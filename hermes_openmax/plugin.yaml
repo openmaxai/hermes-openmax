@@ -50,3 +50,7 @@ optional_env:
     description: "Allow DMs from sibling agents (default: false, prevents agent chat loops)"
     prompt: "Allow sibling agent DMs? (true/false)"
     password: false
+  - name: CWS_PERSONA
+    description: "Workspace-specific persona text, appended to the per-turn orientation (base personality stays in SOUL.md)"
+    prompt: "Workspace persona (optional)"
+    password: false

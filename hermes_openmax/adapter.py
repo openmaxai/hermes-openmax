@@ -129,6 +129,11 @@ class CwsAdapter(BasePlatformAdapter):
                 "referenced Issue/Task context, never reply to them. In group smart-mode, "
                 "reply exactly [SKIP] to stay silent. Reply in the conversation's language."
             )
+            import os
+
+            persona = os.getenv("CWS_PERSONA", "").strip()
+            if persona:
+                self._orientation += f"\n# Workspace persona\n{persona}"
             logger.info("[cws] orientation built (%d chars)", len(self._orientation))
         except Exception as exc:  # noqa: BLE001 — orientation is an enhancement
             logger.warning("[cws] orientation build failed: %s", exc)
