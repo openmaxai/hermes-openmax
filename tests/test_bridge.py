@@ -26,6 +26,9 @@ class FakeComm:
     async def sync(self, since_seq, device_id, limit=100):
         return {"events": [], "has_more": False}
 
+    async def get_conversation(self, conv_id):
+        return {"id": conv_id, "type": getattr(self, "conv_type", "dm")}
+
 
 def make_bridge(tmp_path, on_message, member_id="me-1"):
     cfg = CwsConfig(
@@ -35,7 +38,9 @@ def make_bridge(tmp_path, on_message, member_id="me-1"):
         org_id="org-1",
         member_id=member_id,
     )
-    bridge = CwsBridge(cfg, storage=FileStorage(tmp_path), on_message=on_message)
+    bridge = CwsBridge(
+        cfg, storage=FileStorage(tmp_path), on_message=on_message, billing_gate_enabled=False
+    )
     bridge.comm = FakeComm()
     return bridge
 

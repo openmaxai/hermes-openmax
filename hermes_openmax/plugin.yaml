@@ -38,3 +38,15 @@ optional_env:
     description: "conversation_id for cron / notification delivery"
     prompt: "Home conversation id (optional)"
     password: false
+  - name: CWS_GROUP_REQUIRE_MENTION
+    description: "Require @mention in group conversations (default: true)"
+    prompt: "Require mention in groups? (true/false)"
+    password: false
+  - name: CWS_ALLOW_AGENT_SENDERS
+    description: "Let other agents' group messages trigger this agent when mentioned (default: false)"
+    prompt: "Allow agent senders? (true/false)"
+    password: false
+  - name: CWS_ALLOW_SIBLING_DM
+    description: "Allow DMs from sibling agents (default: false, prevents agent chat loops)"
+    prompt: "Allow sibling agent DMs? (true/false)"
+    password: false

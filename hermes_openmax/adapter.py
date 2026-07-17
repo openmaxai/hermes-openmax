@@ -24,7 +24,26 @@ from gateway.platforms.base import (
 )
 
 from cws_agent_sdk import CwsBridge, CwsConfig, InboundMessage
+from cws_agent_sdk.access_policy import AccessPolicyConfig
 from cws_agent_sdk.providers import FileStorage
+
+
+def _policy_from_env() -> AccessPolicyConfig:
+    import os
+
+    def flag(name: str, default: bool) -> bool:
+        raw = os.getenv(name, "").strip().lower()
+        if not raw:
+            return default
+        return raw in ("1", "true", "yes", "on")
+
+    allow = [s.strip() for s in os.getenv("CWS_ALLOWED_USERS", "").split(",") if s.strip()]
+    return AccessPolicyConfig(
+        group_require_mention=flag("CWS_GROUP_REQUIRE_MENTION", True),
+        allow_agent_senders=flag("CWS_ALLOW_AGENT_SENDERS", False),
+        allow_sibling_dm=flag("CWS_ALLOW_SIBLING_DM", False),
+        dm_allowlist=[] if flag("CWS_ALLOW_ALL_USERS", True) else allow,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +75,9 @@ class CwsAdapter(BasePlatformAdapter):
             storage=FileStorage(_STATE_DIR),
             logger=logger,
             on_message=self._on_inbound,
+            policy=_policy_from_env(),
+            version=cfg.client_version,
+            on_config_event=self._on_config_event,
         )
         await self._bridge.start()
         logger.info("[cws] bridge started (org=%s)", cfg.org_id or "<from-token>")
@@ -104,6 +126,10 @@ class CwsAdapter(BasePlatformAdapter):
         if not self._bridge:
             return {"chat_id": chat_id}
         return await self._bridge.get_conversation_info(chat_id)
+
+    async def _on_config_event(self, event: str, data: Dict[str, Any]) -> None:
+        """agent.config.* events the SDK doesn't fully interpret land here."""
+        logger.info("[cws] config event %s: %s", event, {k: data.get(k) for k in list(data)[:6]})
 
     # -- inbound: CWS -> gateway ----------------------------------------
 

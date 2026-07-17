@@ -21,6 +21,7 @@ class InboundMessage:
     reply_to_message_id: Optional[str] = None
     created_at: Optional[str] = None
     media: list[dict] = field(default_factory=list)
+    mentions: list[dict] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     raw: Any = None
 

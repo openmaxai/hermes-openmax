@@ -17,12 +17,20 @@ import asyncio
 from collections import OrderedDict
 from typing import Awaitable, Callable, Optional
 
-from .codec import FRAME_MESSAGE, FRAME_SYNC, Frame, encode_typing
+from .access_policy import AccessPolicyConfig, decide_inbound
+from .codec import FRAME_MESSAGE, FRAME_SYNC, FRAME_SYSTEM, Frame, encode_typing
 from .config import CwsConfig
 from .errors import CwsApiError
 from .http import CwsHttpClient
 from .providers import FileStorage, Logger, StdLogger
-from .services import CommService
+from .reporters import (
+    OVERDUE_NOTICE,
+    BillingGate,
+    MetricsReporter,
+    OnlineReporter,
+    RuntimeStateProvider,
+)
+from .services import AsService, CommService, ConnService, CoreService, KbService, TmService
 from .token import TokenManager
 from .types import InboundMessage, SendReceipt
 from .ws import CwsWsClient
@@ -39,6 +47,12 @@ class CwsBridge:
         storage: FileStorage,
         on_message: Callable[[InboundMessage], Awaitable[None]],
         logger: Optional[Logger] = None,
+        policy: Optional[AccessPolicyConfig] = None,
+        version: str = "",
+        runtime_state: Optional[RuntimeStateProvider] = None,
+        billing_gate_enabled: bool = True,
+        metrics_interval_s: float = 300.0,
+        on_config_event: Optional[Callable[[str, dict], Awaitable[None]]] = None,
     ):
         self._cfg = cfg
         self._storage = storage
@@ -47,6 +61,27 @@ class CwsBridge:
         self._tokens = TokenManager(cfg, storage=storage, logger=self._log)
         self._http = CwsHttpClient(cfg, self._tokens, logger=self._log)
         self.comm = CommService(self._http)
+        self.core = CoreService(self._http)
+        self.tm = TmService(self._http)
+        self.kb = KbService(self._http)
+        self.artifacts = AsService(self._http)
+        self.conn = ConnService(self._http)
+        self._online = OnlineReporter(self._http, logger=self._log)
+        self._metrics = MetricsReporter(
+            self._http,
+            lambda: self._cfg.member_id,
+            version=version or cfg.client_version,
+            runtime_state=runtime_state,
+            logger=self._log,
+        )
+        self._billing: Optional[BillingGate] = (
+            BillingGate(self._http, logger=self._log) if billing_gate_enabled else None
+        )
+        self._metrics_interval_s = metrics_interval_s
+        self._metrics_task: Optional[asyncio.Task] = None
+        self._on_config_event = on_config_event
+        self.owner_member_id: str = ""
+        self._group_mode_overrides: dict[str, str] = {}  # conv_id -> raw mode
         self._ws = CwsWsClient(
             cfg,
             ticket_provider=self._tokens.get_ws_ticket,
@@ -55,9 +90,11 @@ class CwsBridge:
             on_auth_reset=self._tokens.invalidate,
             logger=self._log,
         )
+        self._policy = policy or AccessPolicyConfig()
         self._seen: "OrderedDict[str, None]" = OrderedDict()
         self._inflight: set[str] = set()
         self._own_client_msg_ids: "OrderedDict[str, None]" = OrderedDict()
+        self._conv_types: "OrderedDict[str, str]" = OrderedDict()  # conv_id -> dm|group|...
         self._sync_seq: int = int((storage.read_json(_SYNC_SEQ_KEY) or {}).get("seq", 0))
         self._running = False
 
@@ -66,16 +103,45 @@ class CwsBridge:
     async def start(self) -> None:
         # Fail fast on bad credentials before going async.
         await self._tokens.get_access_token()
+        await self._resolve_identity()
         self._running = True
+        if self._cfg.member_id:
+            await self._online.report(self._cfg.member_id)
+            self._metrics_task = asyncio.create_task(self._metrics_loop(), name="cws-metrics")
         self._ws.start()
         # Catch up anything missed while offline.
         await self._sync_missed()
 
     async def stop(self) -> None:
         self._running = False
+        if self._metrics_task:
+            self._metrics_task.cancel()
+            self._metrics_task = None
         await self._ws.stop()
         await self._http.aclose()
         await self._tokens.aclose()
+
+    async def _resolve_identity(self) -> None:
+        """Fill member_id from /me when unset; pull authoritative owner."""
+        try:
+            if not self._cfg.member_id:
+                me = await self.core.me()
+                self._cfg.member_id = str(me.get("member_id") or "")
+                if not self._cfg.org_id:
+                    self._cfg.org_id = str(me.get("org_id") or "")
+            if self._cfg.member_id:
+                member = await self.core.get_member(self._cfg.member_id)
+                self.owner_member_id = str(member.get("owner_member_id") or "")
+        except CwsApiError as exc:
+            self._log.warn("identity/owner resolve failed (non-fatal):", exc)
+
+    async def _metrics_loop(self) -> None:
+        while self._running:
+            try:
+                await self._metrics.report_once()
+            except Exception as exc:  # noqa: BLE001 — reporting never breaks the loop
+                self._log.warn("metrics tick failed:", exc)
+            await asyncio.sleep(self._metrics_interval_s)
 
     def is_running(self) -> bool:
         return self._running and self._ws.is_open()
@@ -126,7 +192,41 @@ class CwsBridge:
                     ev.get("message_id"),
                     int(ev.get("seq") or 0),
                 )
+        elif frame.type == FRAME_SYSTEM:
+            await self._handle_system_frame(frame)
         # typing / read_state / presence / acks: no runtime delivery needed.
+
+    async def _handle_system_frame(self, frame: Frame) -> None:
+        """agent.config.* hot updates: {event, conversation_id, data}."""
+        event = str(frame.payload.get("event", ""))
+        data = frame.payload.get("data") or {}
+        if not event.startswith("agent.config."):
+            return
+        self._log.log("config event:", event)
+        if event == "agent.config.dm_allowlist_changed":
+            action = str(data.get("action", "")).lower()
+            ids = [str(i) for i in data.get("member_ids") or []]
+            if action == "add":
+                for i in ids:
+                    if i not in self._policy.dm_allowlist:
+                        self._policy.dm_allowlist.append(i)
+            elif action == "remove":
+                self._policy.dm_allowlist = [
+                    i for i in self._policy.dm_allowlist if i not in ids
+                ]
+        elif event == "agent.config.group_mode_changed":
+            conv = str(data.get("conversation_id", ""))
+            if conv:
+                self._group_mode_overrides[conv] = str(data.get("mode", ""))
+        elif event == "agent.config.owner_changed":
+            self.owner_member_id = str(data.get("new_owner_member_id", ""))
+        # Other events (dm_policy / group_scope / group_allowlist / allowfrom)
+        # are forwarded to the adapter callback; interpretation is host policy.
+        if self._on_config_event:
+            try:
+                await self._on_config_event(event, data)
+            except Exception as exc:  # noqa: BLE001 — host callback must not kill WS
+                self._log.warn("on_config_event error:", exc)
 
     async def _handle_message_frame(self, frame: Frame) -> None:
         p = frame.payload
@@ -156,6 +256,27 @@ class CwsBridge:
                 self._mark_seen(key)
                 await self._advance(conversation_id, seq)
                 return
+            msg.conversation_type = await self._conversation_type(conversation_id)
+            decision = decide_inbound(
+                msg,
+                self_member_id=self._cfg.member_id,
+                cfg=self._effective_policy(conversation_id),
+            )
+            if decision.handle and self._billing is not None and await self._billing.is_suspended():
+                self._log.warn("billing suspended — skipping delivery", conversation_id)
+                if self._billing.should_send_overdue_notice(conversation_id):
+                    try:
+                        await self.comm.send_message(conversation_id, OVERDUE_NOTICE)
+                    except CwsApiError as exc:
+                        self._log.warn("overdue notice failed:", exc)
+                self._mark_seen(key)
+                await self._advance(conversation_id, msg.seq or seq)
+                return
+            if not decision.handle:
+                self._log.log(f"policy skip [{decision.reason}] conv={conversation_id} msg={message_id}")
+                self._mark_seen(key)
+                await self._advance(conversation_id, msg.seq or seq)
+                return
             # Delivery point — exceptions propagate, watermark stays put, /sync replays.
             await self._on_message(msg)
             self._mark_seen(key)
@@ -175,7 +296,9 @@ class CwsBridge:
         if self._cfg.member_id and str(m.get("sender_id", "")) == self._cfg.member_id:
             return None
         text = self._extract_text(m, content)
+        mentions = m.get("mentions") or []
         return InboundMessage(
+            mentions=[mm for mm in mentions if isinstance(mm, dict)],
             message_id=str(m.get("id", "")),
             conversation_id=str(m.get("conversation_id", conversation_id)),
             org_id=str(m.get("org_id", self._cfg.org_id)),
@@ -205,6 +328,35 @@ class CwsBridge:
         if isinstance(m.get("content"), str):
             return m["content"]
         return ""
+
+    def _effective_policy(self, conversation_id: str) -> AccessPolicyConfig:
+        """Apply a per-conversation group-mode override on top of the base policy."""
+        mode = self._group_mode_overrides.get(conversation_id, "")
+        if not mode:
+            return self._policy
+        from dataclasses import replace
+
+        low = mode.lower()
+        if "mention" in low:
+            return replace(self._policy, group_require_mention=True)
+        if low in ("open", "all") or "open" in low:
+            return replace(self._policy, group_require_mention=False)
+        return self._policy
+
+    async def _conversation_type(self, conversation_id: str) -> str:
+        cached = self._conv_types.get(conversation_id)
+        if cached:
+            return cached
+        conv_type = "dm"
+        try:
+            info = await self.comm.get_conversation(conversation_id)
+            conv_type = str(info.get("type", "dm")).lower() or "dm"
+        except CwsApiError as exc:
+            self._log.warn("get_conversation failed, assuming dm:", exc)
+        self._conv_types[conversation_id] = conv_type
+        while len(self._conv_types) > 512:
+            self._conv_types.popitem(last=False)
+        return conv_type
 
     # -- watermarks ---------------------------------------------------------
 

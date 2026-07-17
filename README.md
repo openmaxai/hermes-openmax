@@ -80,13 +80,31 @@ Confirmed contract details:
   cws-comm direct surface) and returns `{conversation, created}`. ✅
 - `ws_url` may be given with or without the `/ws` path; the SDK normalizes.
 
+## zylos-openmax parity surfaces (aligned 2026-07-17, live-verified)
+
+| Surface | Implementation | Live check |
+|---|---|---|
+| online-report | `OnlineReporter` — POST `/agents/{member}/online-report` at bridge start | ✅ `triggered=True` |
+| access policy | `access_policy.decide_inbound` — group @mention gate, agent-loop guards, DM allowlist; per-conv `group_mode` overrides | ✅ live `policy skip [system_sender]` |
+| billing gate | `BillingGate` — `/billing/plan-state` → `usage_snapshot.enforcement_suspended`, 60s cache, fail-open, throttled overdue notice | ✅ suspended=False |
+| owner sync | `/me` auto-resolves member_id; `/members/{id}` → `owner_member_id`; `agent.config.owner_changed` hot-update | ✅ owner resolved |
+| config hot-update | WS system frames `agent.config.*` (allowlist/group-mode/owner interpreted; rest → adapter callback) | unit-tested |
+| runtime metrics | `MetricsReporter` — PUT `/agents/{member}/runtime-metrics` on interval; degrades to version-only without a RuntimeStateProvider | ✅ PUT ok |
+| services | `TmService` / `KbService` / `AsService` (presigned two-phase upload) / `CoreService` / `ConnService` | ✅ tm/kb/core smoke |
+
+Explicitly NOT ported (owner decision 2026-07-17 — zylos-adapter-only concerns):
+channel-liveness reporter, channel-connector (IM install), auto-upgrade.
+
 ## Known open items
 
 1. **Media** — inbound attachments are surfaced in `InboundMessage.media` but
-   download (cws-as) is not wired yet; outbound is text-only.
+   download/upload helpers (`AsService`) are not yet wired into the adapter's
+   MessageEvent media path; outbound is text-only.
 2. **Ops alignment** — reply causation metadata (`interaction_id`,
    `causation_message_id`) can be passed via `send(metadata=...)`; the server
    treats metadata as opaque today.
 3. **Gateway smoke** — the plugin surface is validated against Hermes v0.18.2
    (registry/adapter/MessageEvent), but a full `hermes gateway run` session
    with the plugin enabled hasn't been exercised yet.
+4. **Hermes tools** — workspace services (tm/kb/as) could be exposed as native
+   Hermes tools via `ctx.register_tool()`; SDK clients are ready.
