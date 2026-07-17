@@ -50,6 +50,16 @@ logger = logging.getLogger(__name__)
 _STATE_DIR = "~/.hermes/platforms/cws"
 
 
+class _SdkLogger:
+    """Adapt stdlib logging to the SDK's Logger protocol (.log/.warn *args)."""
+
+    def log(self, *args) -> None:
+        logger.info("[cws] %s", " ".join(str(a) for a in args))
+
+    def warn(self, *args) -> None:
+        logger.warning("[cws] %s", " ".join(str(a) for a in args))
+
+
 class CwsAdapter(BasePlatformAdapter):
     """OpenMax Workspace (CWS) adapter."""
 
@@ -73,7 +83,7 @@ class CwsAdapter(BasePlatformAdapter):
         self._bridge = CwsBridge(
             cfg,
             storage=FileStorage(_STATE_DIR),
-            logger=logger,
+            logger=_SdkLogger(),
             on_message=self._on_inbound,
             policy=_policy_from_env(),
             version=cfg.client_version,
@@ -98,17 +108,18 @@ class CwsAdapter(BasePlatformAdapter):
     async def send(
         self,
         chat_id: str,
-        text: str,
+        content: str,
         reply_to: Optional[str] = None,
-        **kwargs: Any,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if not self._bridge:
             return SendResult(success=False, error="cws bridge not connected")
         try:
             receipt = await self._bridge.send(
                 conversation_id=chat_id,
-                content=text,
+                content=content,
                 reply_to=reply_to,
+                metadata=metadata,
             )
             return SendResult(success=True, message_id=receipt.message_id)
         except Exception as exc:  # noqa: BLE001 — surface any send failure to gateway

@@ -13,8 +13,7 @@ def check_requirements() -> bool:
     return True
 
 
-def validate_config() -> list[str]:
-    """Return a list of human-readable config problems (empty = ok)."""
+def _config_problems() -> list[str]:
     problems = []
     for var in ("CWS_BFF_URL", "CWS_WS_URL", "CWS_API_KEY"):
         if not os.getenv(var, "").strip():
@@ -22,25 +21,42 @@ def validate_config() -> list[str]:
     return problems
 
 
-def is_connected() -> bool:
-    from .adapter import CwsAdapter
+def validate_config(config=None) -> bool:
+    """Registry contract: truthy = config valid (see platform_registry.py:304).
 
-    return CwsAdapter.last_instance_connected()
+    Accepts an optional PlatformConfig positional (the registry passes one)."""
+    problems = _config_problems()
+    if problems:
+        import logging
+
+        logging.getLogger(__name__).warning("[cws] config problems: %s", problems)
+    return not problems
+
+
+def is_connected(config=None) -> bool:
+    """Gateway enablement gate: 'has the user configured credentials?'.
+
+    Called by the registry enable pass WITH a probe PlatformConfig argument.
+    Must NOT mean 'is the adapter currently connected' — this runs BEFORE any
+    adapter exists to decide whether to enable the platform (same semantics
+    as the Discord/IRC plugins: env-var presence).
+    """
+    return not _config_problems()
 
 
 def _env_enablement():
     """Seed PlatformConfig.extra from env so env-only setups appear in status."""
     if not os.getenv("CWS_API_KEY", "").strip():
         return None
-    extra = {
+    seed = {
         "bff_url": os.getenv("CWS_BFF_URL", ""),
         "ws_url": os.getenv("CWS_WS_URL", ""),
         "org_id": os.getenv("CWS_ORG_ID", ""),
     }
     home = os.getenv("CWS_HOME_CHANNEL", "").strip()
     if home:
-        return {"extra": extra, "home_channel": {"chat_id": home}}
-    return {"extra": extra}
+        seed["home_channel"] = {"chat_id": home}
+    return seed
 
 
 def register(ctx):
