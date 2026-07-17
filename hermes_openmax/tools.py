@@ -338,9 +338,12 @@ ARTIFACTS_SCHEMA = {
     "name": "workspace_artifacts",
     "description": (
         "OpenMax workspace files/artifacts. Actions: resolve(uris[]) -> "
-        "download URLs; upload(conversation_id, local_path) -> attach a local "
-        "file to a conversation; kb_upload(parent_id, local_path) -> upload "
-        "into the knowledge base tree."
+        "download URLs (for YOUR OWN downloading/reading only — presigned "
+        "URLs expire in minutes and must NEVER be pasted into chat); "
+        "upload(conversation_id, local_path); kb_upload(parent_id, "
+        "local_path). NOTE: to SHOW an image/file to the user in chat, do "
+        "NOT use this tool — instead include MEDIA:/absolute/path in your "
+        "reply text, which delivers it as a native image message."
     ),
     "parameters": {
         "type": "object",

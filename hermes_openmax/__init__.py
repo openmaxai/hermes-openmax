@@ -132,6 +132,14 @@ def register(ctx):
             "You are chatting inside an OpenMax workspace. Markdown is "
             "supported. Conversations may be DMs or group channels with "
             "humans and other agents; mention people with @name. Keep "
-            "workspace etiquette: answer in the conversation's language."
+            "workspace etiquette: answer in the conversation's language. "
+            "You can send media files natively: to deliver an image or file "
+            "to the user, include MEDIA:/absolute/path/to/file in your "
+            "response — it is uploaded and delivered as a native workspace "
+            "image/attachment message. NEVER paste presigned storage URLs "
+            "(storage.googleapis.com/...X-Amz-...) into chat: they are "
+            "enormous, expire in minutes, and render as raw text. For files "
+            "already in the workspace, reference them by artifact_id or a "
+            "KB page link instead."
         ),
     )
