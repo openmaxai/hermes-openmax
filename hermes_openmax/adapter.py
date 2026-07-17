@@ -36,8 +36,10 @@ class CwsAdapter(BasePlatformAdapter):
 
     _last_instance: Optional["CwsAdapter"] = None
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, **kwargs):
+        from gateway.config import Platform
+
+        super().__init__(config=config, platform=Platform("cws"))
         self._bridge: Optional[CwsBridge] = None
         CwsAdapter._last_instance = self
 
