@@ -1,0 +1,40 @@
+name: hermes-openmax
+label: OpenMax Workspace
+kind: platform
+version: 0.1.0
+description: >
+  CWS / OpenMax Workspace channel for Hermes Agent.
+  Connects the agent to a coco workspace org over the cws-comm WebSocket
+  and cws-core REST API, so workspace conversations become a first-class
+  Hermes chat platform (alongside Lark, Telegram, ...).
+author: coco-workspace
+requires_env:
+  - name: CWS_BFF_URL
+    description: "cws-core BFF base URL (e.g. https://api.<env>.coco.xyz)"
+    prompt: "CWS BFF URL"
+    password: false
+  - name: CWS_WS_URL
+    description: "cws-comm WebSocket URL (e.g. wss://comm.<env>.coco.xyz)"
+    prompt: "CWS WebSocket URL"
+    password: false
+  - name: CWS_API_KEY
+    description: "Agent API key issued by /auth/register/agent (cwsk_...)"
+    prompt: "CWS agent API key"
+    password: true
+optional_env:
+  - name: CWS_ORG_ID
+    description: "Workspace org id (empty = resolve from token/invitation)"
+    prompt: "Org ID (optional)"
+    password: false
+  - name: CWS_ALLOWED_USERS
+    description: "Comma-separated member ids allowed to talk to the agent"
+    prompt: "Allowed member ids (optional)"
+    password: false
+  - name: CWS_ALLOW_ALL_USERS
+    description: "Allow all workspace members (default: true — CWS already scopes access by org)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: CWS_HOME_CHANNEL
+    description: "conversation_id for cron / notification delivery"
+    prompt: "Home conversation id (optional)"
+    password: false
