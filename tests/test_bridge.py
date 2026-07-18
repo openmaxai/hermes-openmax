@@ -225,7 +225,7 @@ async def test_group_smart_mode_and_history_context(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_group_silent_mode_drops(tmp_path):
+async def test_group_silent_mode_observes_without_reply(tmp_path):
     got = []
 
     async def on_message(m):
@@ -236,7 +236,8 @@ async def test_group_silent_mode_drops(tmp_path):
     b._group_mode_overrides["conv-1"] = "silent"
     b.comm.messages["conv-1:1"] = detail()
     await b._handle_frame(msg_frame())
-    assert got == []
+    assert len(got) == 1
+    assert got[0].metadata["group_silent"] is True
     assert b.comm.sync_acks == [10]  # consumed silently
 
 

@@ -347,10 +347,15 @@ class CommService:
             json={"since_seq": int(since_seq), "device_id": device_id, "limit": limit},
         )
 
-    async def sync_ack(self, device_id: str, seq: int) -> None:
+    async def sync_ack(self, device_id: str, seq: int, app_version: str = "") -> None:
         await self._http.post(
             "/api/v1/sync/ack",
-            json={"device_id": device_id, "seq": int(seq), "platform": "agent"},
+            json={
+                "device_id": device_id,
+                "seq": int(seq),
+                "platform": "agent",
+                "app_version": app_version,
+            },
         )
 
     # -- conversations -------------------------------------------------------
