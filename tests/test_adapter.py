@@ -6,7 +6,10 @@ from hermes_openmax.behavior import (
 )
 
 
-def test_extract_local_markdown_images_accepts_existing_file_uri_with_caption(tmp_path):
+def test_extract_local_markdown_images_accepts_existing_file_uri_with_caption(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CWS_MEDIA_ROOTS", str(tmp_path))
     image = tmp_path / "hello world.png"
     image.write_bytes(b"png")
     content = f"![图文说明]({image.as_uri()})"
@@ -20,6 +23,38 @@ def test_extract_local_markdown_images_accepts_existing_file_uri_with_caption(tm
 def test_extract_local_markdown_images_rejects_missing_local_file(tmp_path):
     missing = (tmp_path / "missing.png").as_uri()
     content = f"![不存在]({missing})"
+
+    images, cleaned = extract_local_markdown_images(content)
+
+    assert images == []
+    assert cleaned == content
+
+
+def test_extract_local_markdown_images_rejects_file_outside_trusted_roots(
+    tmp_path, monkeypatch
+):
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    private = tmp_path / "private.png"
+    private.write_bytes(b"png")
+    monkeypatch.setenv("CWS_MEDIA_ROOTS", str(trusted))
+    content = f"![private]({private.as_uri()})"
+
+    images, cleaned = extract_local_markdown_images(content)
+
+    assert images == []
+    assert cleaned == content
+
+
+def test_extract_local_markdown_images_rejects_symlink_escape(tmp_path, monkeypatch):
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    private = tmp_path / "private.png"
+    private.write_bytes(b"png")
+    link = trusted / "linked.png"
+    link.symlink_to(private)
+    monkeypatch.setenv("CWS_MEDIA_ROOTS", str(trusted))
+    content = f"![linked]({link.as_uri()})"
 
     images, cleaned = extract_local_markdown_images(content)
 

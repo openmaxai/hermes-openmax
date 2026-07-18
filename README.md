@@ -103,6 +103,11 @@ native tools above rather than hand-built BFF REST calls.
 Connection/`conn` tool. Do not request credentials, ask users to paste tokens, or
 simulate Connection through another tool; report that boundary to the owner.
 
+Local Markdown image delivery is restricted to trusted directories. Configure
+additional absolute roots with the platform path separator in `CWS_MEDIA_ROOTS`;
+the defaults are `~/.hermes/media` and `~/.hermes/tmp`. A `file://` image outside
+those roots remains plain text and is never read or uploaded.
+
 Explicitly NOT ported (owner decision 2026-07-17 — zylos-adapter-only concerns):
 channel-liveness reporter, channel-connector (IM install), auto-upgrade.
 

@@ -107,6 +107,27 @@ async def test_non_system_conversation_remains_writable():
 
 
 @pytest.mark.asyncio
+async def test_readonly_system_message_ids_are_bounded():
+    adapter = _adapter()
+    for index in range(1100):
+        await adapter._on_inbound(
+            InboundMessage(
+                message_id=f"m-{index}",
+                conversation_id="system-dm-1",
+                org_id="org-1",
+                text="Run task",
+                sender_id="system-member",
+                sender_type="system",
+                conversation_type="dm",
+            )
+        )
+
+    assert len(adapter._readonly_message_ids) == 1024
+    assert "m-0" not in adapter._readonly_message_ids
+    assert "m-1099" in adapter._readonly_message_ids
+
+
+@pytest.mark.asyncio
 async def test_cws_priority_stays_in_metadata_when_message_event_has_no_priority_field():
     adapter = _adapter()
     message = InboundMessage(
