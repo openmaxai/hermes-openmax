@@ -217,7 +217,15 @@ class CwsBridge:
             {
                 "conversation_id": conversation_id,
                 "mode": str(config.get("mode") or "mention"),
-                "allow_from": [str(v) for v in config.get("allow_from") or ["*"]],
+                "allow_from": [
+                    str(v)
+                    for v in (
+                        config.get("allow_from")
+                        if "allow_from" in config
+                        else config.get("allowFrom")
+                    )
+                    or ["*"]
+                ],
             }
             for conversation_id, config in self._policy.group_configs.items()
         ]
@@ -587,10 +595,6 @@ class CwsBridge:
                 # (handled or not) so later turns get conversation context.
                 self._record_group_history(conversation_id, msg)
             mode = self._group_mode_overrides.get(conversation_id, "").lower()
-            if is_group and mode == "silent":
-                self._mark_seen(key)
-                await self._advance(conversation_id, msg.seq or seq)
-                return
             # zylos parity: dm_policy=owner with no owner bound — the first
             # human DM sender becomes the owner (persisted; platform data
             # overrides on next identity resolve if it disagrees).
@@ -614,6 +618,10 @@ class CwsBridge:
                 owner_member_id=self.owner_member_id,
                 sender_owner_member_id=await self._sender_owner(msg),
             )
+            if decision.handle and is_group and (
+                mode == "silent" or decision.reason == "group_silent"
+            ):
+                msg.metadata["group_silent"] = True
             if decision.handle and is_group:
                 history = self._group_history.get(conversation_id, [])
                 recent = [h for h in history[:-1]][-_GROUP_CONTEXT_N:]
@@ -696,8 +704,13 @@ class CwsBridge:
         if self._cfg.member_id and str(m.get("sender_id", "")) == self._cfg.member_id:
             return None
         text = self._extract_text(m, content)
-        mentions = m.get("mentions") or []
         extra_meta = dict(m.get("metadata") or {})
+        mentions = (
+            m.get("mentions")
+            or m.get("mention_user_ids")
+            or extra_meta.get("mentions")
+            or []
+        )
         priority = m.get("priority")
         # zylos system-message.js parity: system events carry priority under
         # metadata.systemEvent.priority as urgent/high/normal.
@@ -712,7 +725,7 @@ class CwsBridge:
         elif priority is not None:
             extra_meta["cws_priority"] = int(priority)  # 1=urgent 2=high 3=normal
         return InboundMessage(
-            mentions=[mm for mm in mentions if isinstance(mm, dict)],
+            mentions=[mm for mm in mentions if isinstance(mm, (dict, str))],
             message_id=str(m.get("id", "")),
             conversation_id=str(m.get("conversation_id", conversation_id)),
             org_id=str(m.get("org_id", self._cfg.org_id)),
@@ -896,6 +909,17 @@ class CwsBridge:
             return replace(self._policy, group_require_mention=True)
         if low in ("open", "all") or "open" in low:
             return replace(self._policy, group_require_mention=False)
+        if low == "silent":
+            from copy import deepcopy
+
+            groups = deepcopy(self._policy.group_configs)
+            groups.setdefault(conversation_id, {"mode": "silent", "allow_from": ["*"]})
+            groups[conversation_id]["mode"] = "silent"
+            return replace(
+                self._policy,
+                group_require_mention=False,
+                group_configs=groups,
+            )
         return self._policy
 
     async def _conversation_info(self, conversation_id: str) -> dict:
@@ -930,7 +954,7 @@ class CwsBridge:
             self._sync_seq = seq
             self._storage.write_json(_SYNC_SEQ_KEY, {"seq": seq})
             try:
-                await self.comm.sync_ack(self._cfg.device_id, seq)
+                await self._sync_ack(seq)
             except CwsApiError as exc:
                 self._log.warn("sync_ack failed:", exc)
 
@@ -962,10 +986,21 @@ class CwsBridge:
                     self._sync_seq = cursor
                     self._storage.write_json(_SYNC_SEQ_KEY, {"seq": cursor})
                     try:
-                        await self.comm.sync_ack(self._cfg.device_id, cursor)
+                        await self._sync_ack(cursor)
                     except CwsApiError:
                         pass
                 return
+
+    async def _sync_ack(self, seq: int) -> None:
+        """Send alpha.2 ack metadata, tolerating legacy test doubles."""
+        try:
+            await self.comm.sync_ack(
+                self._cfg.device_id, seq, self._cfg.client_version
+            )
+        except TypeError as exc:
+            if "positional argument" not in str(exc):
+                raise
+            await self.comm.sync_ack(self._cfg.device_id, seq)
 
     async def _sync_missed(self) -> None:
         async with self._sync_lock:

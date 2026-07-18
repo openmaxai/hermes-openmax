@@ -47,11 +47,20 @@ class AccessDecision:
 
 def _is_mentioned(msg: InboundMessage, self_member_id: str) -> bool:
     for m in msg.mentions or []:
+        if isinstance(m, str) and m == self_member_id:
+            return True
         mtype = str(m.get("type", "")).lower() if isinstance(m, dict) else ""
         if mtype in ("all", "all_agents"):
             return True
-        if isinstance(m, dict) and str(m.get("member_id", "")) == self_member_id:
-            return True
+        if isinstance(m, dict):
+            target = (
+                m.get("member_id")
+                or m.get("entity_id")
+                or m.get("mentioned_id")
+                or m.get("id")
+            )
+            if str(target or "") == self_member_id:
+                return True
     return False
 
 
@@ -117,12 +126,20 @@ def decide_inbound(
     if policy == "allowlist" and group is None:
         return AccessDecision(False, "group_not_allowlisted")
     group = group or {}
-    allow_from = [str(v) for v in group.get("allow_from") or []]
+    allow_from = [
+        str(v)
+        for v in (
+            group.get("allow_from")
+            if "allow_from" in group
+            else group.get("allowFrom")
+        )
+        or []
+    ]
     if allow_from and "*" not in allow_from and msg.sender_id not in allow_from:
         return AccessDecision(False, "group_sender_not_allowed")
     mode = str(group.get("mode") or "").lower()
     if mode == "silent":
-        return AccessDecision(False, "group_silent")
+        return AccessDecision(True, "group_silent")
     if mode == "smart" or not cfg.group_require_mention:
         return AccessDecision(True, "group_open")
     if mentioned:

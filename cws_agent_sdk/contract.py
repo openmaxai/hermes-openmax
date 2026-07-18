@@ -39,13 +39,27 @@ def _policy_from_org(
     dm_policy = str(access.get("dmPolicy", "open")).lower()
     cfg = AccessPolicyConfig(
         dm_policy=dm_policy,
+        group_policy=str(access.get("groupPolicy", "open")).lower(),
         dm_allowlist=[str(i) for i in access.get("dmAllowFrom") or []],
     )
     mode = ""
     conv_id = str((conversation or {}).get("id", ""))
     groups = access.get("groups") or {}
     if conv_id and conv_id in groups:
-        mode = str((groups[conv_id] or {}).get("mode", ""))
+        group = groups[conv_id] or {}
+        mode = str(group.get("mode", ""))
+        cfg.group_configs[conv_id] = {
+            "mode": mode,
+            "allow_from": [
+                str(v)
+                for v in (
+                    group.get("allowFrom")
+                    if "allowFrom" in group
+                    else group.get("allow_from")
+                )
+                or ["*"]
+            ],
+        }
         if "smart" in mode.lower():
             cfg.group_require_mention = False
     return cfg, mode
@@ -90,8 +104,11 @@ def normalize_for_contract(
         msg, self_member_id=self_member, cfg=cfg, owner_member_id=owner_id
     )
     reason = _REASON_MAP.get(decision.reason, decision.reason)
-    if conv_type != "dm" and "smart" in group_mode.lower() and decision.handle:
-        reason = "group:allowlist/smart"
+    if conv_type != "dm" and decision.handle:
+        if group_mode.lower() == "silent" or decision.reason == "group_silent":
+            reason = "group:allowlist/silent"
+        elif "smart" in group_mode.lower():
+            reason = "group:allowlist/smart"
 
     decision_out: dict[str, Any] = {"handle": decision.handle, "reason": reason}
     if decision.reason == "dm_owner" and not owner.get("name"):
@@ -103,7 +120,6 @@ def normalize_for_contract(
 
     out: dict[str, Any] = {
         "orgId": str(org.get("org_id", "")),
-        "orgSlug": str(org.get("slug", "")),
         "conversation": conv,
         "conversationId": conv_id,
         "conversationType": conv_type,

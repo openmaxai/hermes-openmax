@@ -90,6 +90,7 @@ class CwsAdapter(BasePlatformAdapter):
         self._bridge: Optional[CwsBridge] = None
         self._orientation: str = ""
         self._readonly_message_ids: OrderedDict[str, None] = OrderedDict()
+        self._silent_groups: set[str] = set()
         CwsAdapter._last_instance = self
 
     # -- lifecycle -----------------------------------------------------
@@ -183,6 +184,11 @@ class CwsAdapter(BasePlatformAdapter):
         if content.strip().upper() == "[SKIP]":
             logger.info("[cws] reply intentionally skipped for %s", chat_id)
             return SendResult(success=True, message_id="")
+        if chat_id in getattr(self, "_silent_groups", set()) or (
+            metadata and metadata.get("group_silent")
+        ):
+            logger.info("[cws] group silent: suppressing reply for %s", chat_id)
+            return SendResult(success=True, message_id="")
         try:
             receipt = await self._bridge.send(
                 conversation_id=chat_id,
@@ -232,6 +238,10 @@ class CwsAdapter(BasePlatformAdapter):
 
     async def _on_config_event(self, event: str, data: Dict[str, Any]) -> None:
         """agent.config.* events the SDK doesn't fully interpret land here."""
+        if event == "agent.config.group_mode_changed":
+            conv = str(data.get("conversation_id") or "")
+            if conv and str(data.get("mode", "")).lower() != "silent":
+                self._silent_groups.discard(conv)
         logger.info(
             "[cws] config event %s: %s", event, {k: data.get(k) for k in list(data)[:6]}
         )
@@ -251,6 +261,8 @@ class CwsAdapter(BasePlatformAdapter):
             self._readonly_message_ids.move_to_end(msg.message_id)
             while len(self._readonly_message_ids) > 1024:
                 self._readonly_message_ids.popitem(last=False)
+        if msg.metadata.get("group_silent"):
+            self._silent_groups.add(msg.conversation_id)
         # OpenMax groups are conversation-scoped. Do not pass the sender as the
         # session participant, otherwise Hermes creates one session per member
         # instead of one shared session per group.

@@ -89,6 +89,19 @@ def _assert_subset(expected: dict, actual: dict, ctx: str):
             )
 
 
+def test_contract_does_not_emit_deprecated_org_slug():
+    """SDK alpha.2 uses org_id/orgId as the sole runtime organization key."""
+    fx = json.loads((_load("inbound-message")[0]).read_text())
+    actual = normalize_for_contract(
+        fx["org"], fx["frame"], fx["detail"], fx["conversation"]
+    )
+    assert actual["orgId"] == fx["org"]["org_id"]
+    assert "orgSlug" not in actual
+
+
+# -- inbound message normalization ----------------------------------------------
+
+
 @pytest.mark.parametrize("path", _load("inbound-message"), ids=lambda p: p.stem)
 def test_inbound_message_normalization(path):
     fx = json.loads(path.read_text())
