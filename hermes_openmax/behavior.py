@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import re
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _LOCAL_MARKDOWN_IMAGE = re.compile(r"!\[([^\]]*)\]\((file://[^\s\)]+)\)")
+
+
+def _trusted_media_roots() -> tuple[Path, ...]:
+    configured = os.getenv("CWS_MEDIA_ROOTS", "")
+    roots = [
+        Path(value).expanduser() for value in configured.split(os.pathsep) if value
+    ]
+    if not roots:
+        roots = [Path.home() / ".hermes" / "media", Path.home() / ".hermes" / "tmp"]
+    return tuple(root.resolve() for root in roots if root.is_dir())
+
+
+def _is_under(path: Path, roots: tuple[Path, ...]) -> bool:
+    return any(path == root or root in path.parents for root in roots)
 
 
 def _fenced_code_spans(content: str) -> list[tuple[int, int]]:
@@ -20,18 +35,20 @@ def extract_local_markdown_images(content: str) -> tuple[list[tuple[str, str]], 
     images: list[tuple[str, str]] = []
     matched_spans: list[tuple[int, int]] = []
     fenced_spans = _fenced_code_spans(content)
+    trusted_roots = _trusted_media_roots()
     for match in _LOCAL_MARKDOWN_IMAGE.finditer(content):
         if any(start <= match.start() < end for start, end in fenced_spans):
             continue
         uri = match.group(2)
         parsed = urlparse(uri)
-        path = Path(unquote(parsed.path))
+        path = Path(unquote(parsed.path)).resolve()
         if (
             parsed.scheme == "file"
             and not parsed.netloc
             and path.is_absolute()
             and path.is_file()
             and path.suffix.lower() in _IMAGE_EXTENSIONS
+            and _is_under(path, trusted_roots)
         ):
             images.append((uri, match.group(1)))
             matched_spans.append(match.span())

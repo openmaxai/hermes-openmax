@@ -15,6 +15,7 @@ accepted it.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import (
@@ -88,7 +89,7 @@ class CwsAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform("cws"))
         self._bridge: Optional[CwsBridge] = None
         self._orientation: str = ""
-        self._readonly_message_ids: set[str] = set()
+        self._readonly_message_ids: OrderedDict[str, None] = OrderedDict()
         CwsAdapter._last_instance = self
 
     # -- lifecycle -----------------------------------------------------
@@ -242,8 +243,11 @@ class CwsAdapter(BasePlatformAdapter):
         from advancing, so the message is replayed via /sync later."""
         if msg.sender_type == "system":
             if not hasattr(self, "_readonly_message_ids"):
-                self._readonly_message_ids = set()
-            self._readonly_message_ids.add(msg.message_id)
+                self._readonly_message_ids = OrderedDict()
+            self._readonly_message_ids[msg.message_id] = None
+            self._readonly_message_ids.move_to_end(msg.message_id)
+            while len(self._readonly_message_ids) > 1024:
+                self._readonly_message_ids.popitem(last=False)
         source = self.build_source(
             chat_id=msg.conversation_id,
             chat_name=msg.metadata.get("conversation_name") or None,
