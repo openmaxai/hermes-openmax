@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import os
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -14,11 +14,12 @@ _LOCAL_MARKDOWN_IMAGE = re.compile(r"!\[([^\]]*)\]\((file://[^\s\)]+)\)")
 
 def _trusted_media_roots() -> tuple[Path, ...]:
     configured = os.getenv("CWS_MEDIA_ROOTS", "")
-    roots = [
-        Path(value).expanduser() for value in configured.split(os.pathsep) if value
-    ]
-    if not roots:
-        roots = [Path.home() / ".hermes" / "media", Path.home() / ".hermes" / "tmp"]
+    roots = [Path.home() / ".hermes" / "media", Path.home() / ".hermes" / "tmp"]
+    roots.extend(
+        Path(value).expanduser()
+        for value in configured.split(os.pathsep)
+        if value and Path(value).expanduser().is_absolute()
+    )
     return tuple(root.resolve() for root in roots if root.is_dir())
 
 
@@ -41,7 +42,10 @@ def extract_local_markdown_images(content: str) -> tuple[list[tuple[str, str]], 
             continue
         uri = match.group(2)
         parsed = urlparse(uri)
-        path = Path(unquote(parsed.path)).resolve()
+        try:
+            path = Path(unquote(parsed.path)).resolve()
+        except (ValueError, OSError):
+            continue
         if (
             parsed.scheme == "file"
             and not parsed.netloc
@@ -50,7 +54,7 @@ def extract_local_markdown_images(content: str) -> tuple[list[tuple[str, str]], 
             and path.suffix.lower() in _IMAGE_EXTENSIONS
             and _is_under(path, trusted_roots)
         ):
-            images.append((uri, match.group(1)))
+            images.append((path.as_uri(), match.group(1)))
             matched_spans.append(match.span())
 
     if not matched_spans:

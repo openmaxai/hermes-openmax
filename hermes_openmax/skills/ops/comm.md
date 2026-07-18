@@ -116,4 +116,4 @@ cws-core 是 agent owner 的权威来源(可通过 transfer-owner 转移,由 own
 
 ## DM 权限管理
 
-源系统有 DM 准入策略与白名单管理(dm_policy: open/allowlist/owner、dm_allow / dm_revoke / dm_list)。**该配置由平台管理(agent.config 事件热更),当前工具未暴露**;要调整谁可以私聊本 agent,请告知 owner。语义备忘:`owner` 模式下白名单无效(只有 owner 能私聊);切到 `allowlist` 后白名单才生效;`open` 对所有成员开放。
+源系统有 DM 准入策略与白名单管理(dm_policy: open/allowlist/owner、dm_allow / dm_revoke / dm_list)。可用 `workspace_members` 原生动作管理;语义为:`owner` 模式下白名单无效(只有 owner 能私聊);切到 `allowlist` 后白名单才生效;`open` 对所有成员开放。

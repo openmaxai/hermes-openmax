@@ -10,9 +10,72 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any
 
 _STATE_DIR = "~/.hermes/platforms/cws"
+
+# State actions can be replayed by the model/runtime.  Keep notification
+# deduplication local to the process: the task operation remains authoritative
+# and notification delivery is deliberately best effort.
+_PROGRESS_NOTIFICATION_KEYS: set[str] = set()
+_PROGRESS_NOTIFICATION_LOCK = threading.Lock()
+_STATE_ACTIONS = {
+    "activate",
+    "submit-plan",
+    "accept-plan",
+    "deliver",
+    "resume",
+    "terminate",
+    "accept-delivered",
+    "transition",
+    "claim",
+    "start",
+}
+
+
+def _progress_notification_text(kind: str, item_id: str, result: Any) -> str:
+    result = result if isinstance(result, dict) else {}
+    title = str(result.get("title") or result.get("name") or item_id)
+    status = str(result.get("status") or result.get("state") or "updated")
+    return f"📌 {kind} **{title}** 状态已更新为 **{status}**。"
+
+
+async def _notify_progress_once(
+    comm: Any,
+    *,
+    source_conversation_id: str,
+    kind: str,
+    item_id: str,
+    action: str,
+    result: Any,
+) -> None:
+    """Notify the originating conversation once, without affecting the action."""
+    if not source_conversation_id or action not in _STATE_ACTIONS:
+        return
+    result_dict = result if isinstance(result, dict) else {}
+    status = str(result_dict.get("status") or result_dict.get("state") or "updated")
+    key = f"{source_conversation_id}:{kind}:{item_id}:{action}:{status}"
+    with _PROGRESS_NOTIFICATION_LOCK:
+        if key in _PROGRESS_NOTIFICATION_KEYS:
+            return
+        _PROGRESS_NOTIFICATION_KEYS.add(key)
+    try:
+        await comm.send_message(
+            source_conversation_id,
+            _progress_notification_text(kind, item_id, result),
+            metadata={
+                "progress_notification": True,
+                "work_type": kind,
+                "work_id": item_id,
+                "action": action,
+            },
+        )
+    except Exception:
+        # A notification must never turn a successful task operation into a
+        # failed tool call. Remove the key so a later retry can notify.
+        with _PROGRESS_NOTIFICATION_LOCK:
+            _PROGRESS_NOTIFICATION_KEYS.discard(key)
 
 
 def _run(coro_factory) -> str:
@@ -21,6 +84,7 @@ def _run(coro_factory) -> str:
         from cws_agent_sdk.http import CwsHttpClient
         from cws_agent_sdk.providers import FileStorage
         from cws_agent_sdk.services import (
+            AccessPolicyService,
             CommService,
             CoreService,
             KbService,
@@ -38,6 +102,7 @@ def _run(coro_factory) -> str:
                 "kb": KbService(http),
                 "core": CoreService(http),
                 "comm": CommService(http),
+                "policy": AccessPolicyService(storage),
             }
             return await coro_factory(svc)
         finally:
@@ -131,6 +196,10 @@ TASKS_SCHEMA = {
 def handle_tasks(args: dict, **kw: Any) -> str:
     async def go(svc):
         tm = svc["tm"]
+        comm = svc["comm"]
+        source_conversation_id = str(
+            kw.get("source_conversation_id") or kw.get("source_chat_id") or ""
+        )
         a = args.get("action")
         limit = int(args.get("limit") or 20)
         body = args.get("body") or {}
@@ -188,7 +257,16 @@ def handle_tasks(args: dict, **kw: Any) -> str:
         if a == "update_issue":
             return await tm.update_issue(args["issue_id"], body)
         if a == "issue_action":
-            return await tm.issue_action(args["issue_id"], args["name"], body)
+            result = await tm.issue_action(args["issue_id"], args["name"], body)
+            await _notify_progress_once(
+                comm,
+                source_conversation_id=source_conversation_id,
+                kind="issue",
+                item_id=args["issue_id"],
+                action=args["name"],
+                result=result,
+            )
+            return result
         if a == "list_tasks":
             return await tm.list_tasks(
                 args.get("issue_id"),
@@ -203,7 +281,16 @@ def handle_tasks(args: dict, **kw: Any) -> str:
         if a == "create_task":
             return await tm.create_task(args["project_id"], args["issue_id"], body)
         if a == "task_action":
-            return await tm.task_action(args["task_id"], args["name"], body)
+            result = await tm.task_action(args["task_id"], args["name"], body)
+            await _notify_progress_once(
+                comm,
+                source_conversation_id=source_conversation_id,
+                kind="task",
+                item_id=args["task_id"],
+                action=args["name"],
+                result=result,
+            )
+            return result
         if a == "comment_create":
             return await tm.create_comment(
                 args["work_type"], args["work_id"], args["text"]
@@ -433,6 +520,7 @@ MEMBERS_SCHEMA = {
     "description": (
         "OpenMax workspace directory. Actions: me, list(kind=human|agent, search?), "
         "get(member_id), create_dm(peer_member_id), "
+        "dm_policy(policy?), dm_list, dm_allow(member_ids), dm_revoke(member_ids), "
         "agent_profiles(project_id?) -> capability profiles (skills/tags/online) — "
         "MUST consult before assigning work to agents, rename(name), orgs, roles, "
         "frontend_url(path e.g. 'projects?project=X') -> clickable workspace link"
@@ -460,6 +548,7 @@ MEMBERS_SCHEMA = {
             "name": {"type": "string"},
             "project_id": {"type": "string"},
             "path": {"type": "string"},
+            "policy": {"type": "string", "enum": ["open", "allowlist", "owner"]},
         },
         "required": ["action"],
     },
@@ -468,7 +557,7 @@ MEMBERS_SCHEMA = {
 
 def handle_members(args: dict, **kw: Any) -> str:
     async def go(svc):
-        core, comm = svc["core"], svc["comm"]
+        core, comm, policy = svc["core"], svc["comm"], svc["policy"]
         a = args.get("action")
         if a == "me":
             return await core.me()
@@ -480,6 +569,28 @@ def handle_members(args: dict, **kw: Any) -> str:
             return await core.get_member(args["member_id"])
         if a == "create_dm":
             return await comm.create_dm(args["peer_member_id"])
+        if a == "dm_policy":
+            return (
+                policy.set_dm_policy(args["policy"])
+                if args.get("policy")
+                else policy.get_dm_access()
+            )
+        if a == "dm_list":
+            return policy.get_dm_access()
+        if a == "dm_allow":
+            return policy.allow_dm_members(
+                list(
+                    args.get("member_ids")
+                    or ([args["member_id"]] if args.get("member_id") else [])
+                )
+            )
+        if a == "dm_revoke":
+            return policy.revoke_dm_members(
+                list(
+                    args.get("member_ids")
+                    or ([args["member_id"]] if args.get("member_id") else [])
+                )
+            )
         if a == "orgs":
             return await core.list_organizations()
         if a == "roles":
@@ -545,7 +656,9 @@ COMM_SCHEMA = {
         "unread_count/unread_mention), history(conversation_id, limit?), "
         "send(conversation_id, text, reply_to?), "
         "create_group(name, member_ids[], description?). Use this to "
-        "proactively message any conversation (e.g. report to your owner)."
+        "proactively message any conversation (e.g. report to your owner). "
+        "send_attachment(conversation_id, local_path, caption?, reply_to?) uploads, "
+        "finalizes, and sends a native attachment; upload URLs stay internal."
     ),
     "parameters": {
         "type": "object",
@@ -563,6 +676,8 @@ COMM_SCHEMA = {
             "name": {"type": "string"},
             "member_ids": {"type": "array", "items": {"type": "string"}},
             "description": {"type": "string"},
+            "local_path": {"type": "string"},
+            "caption": {"type": "string"},
             "limit": {"type": "integer"},
         },
         "required": ["action"],
@@ -605,6 +720,13 @@ def handle_comm(args: dict, **kw: Any) -> str:
                 args["conversation_id"], args["text"], reply_to=args.get("reply_to")
             )
             return {"sent": True, "message_id": r.message_id}
+        if a == "send_attachment":
+            return await comm.send_local_attachment(
+                args["conversation_id"],
+                args["local_path"],
+                caption=args.get("caption", ""),
+                reply_to=args.get("reply_to"),
+            )
         if a == "create_group":
             return await comm.create_group(
                 args["name"],

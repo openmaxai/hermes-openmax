@@ -16,6 +16,7 @@ from .reporters import (
     RuntimeStateProvider,
 )
 from .services import (
+    AccessPolicyService,
     AsService,
     CommService,
     ConnService,
@@ -35,6 +36,7 @@ __all__ = [
     "OnlineReporter",
     "RuntimeStateProvider",
     "AsService",
+    "AccessPolicyService",
     "CommService",
     "ConnService",
     "CoreService",

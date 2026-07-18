@@ -98,6 +98,41 @@ class MetricsReporter:
             return False
 
 
+class ChannelLivenessReporter:
+    """Report this Hermes OpenMax channel's actual bridge health."""
+
+    def __init__(
+        self,
+        http: CwsHttpClient,
+        member_id_provider: Callable[[], str],
+        health_provider: Callable[[], Optional[bool]],
+        *,
+        logger: Optional[Logger] = None,
+    ):
+        self._http = http
+        self._member_id = member_id_provider
+        self._health = health_provider
+        self._log = logger or StdLogger("[cws-liveness]")
+
+    async def report_once(self) -> bool:
+        member_id = self._member_id()
+        online = self._health()
+        if not member_id or online is None:
+            return False
+        try:
+            await self._http.request(
+                "PUT",
+                f"/api/v1/agents/{member_id}/channel-liveness",
+                json={
+                    "channels": [{"channel_type": "openmax", "online": bool(online)}]
+                },
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — liveness is best-effort
+            self._log.warn("channel-liveness report failed (non-fatal):", exc)
+            return False
+
+
 class BillingGate:
     """GET /api/v1/billing/plan-state → usage_snapshot.enforcement_suspended.
 
