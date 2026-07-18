@@ -7,6 +7,7 @@ import pytest
 
 from cws_agent_sdk.errors import CwsApiError
 from cws_agent_sdk.services import (
+    AccessPolicyService,
     AsService,
     CommService,
     CoreService,
@@ -301,4 +302,151 @@ def test_artifact_url_normalization_and_root_upload():
         "filename": "f",
         "content_type": "text/plain",
         "size_bytes": 1,
+    }
+
+
+class MemoryStorage:
+    def __init__(self, value=None):
+        self.value = value
+
+    def read_json(self, key):
+        assert key == "policy.json"
+        return self.value
+
+    def write_json(self, key, value):
+        assert key == "policy.json"
+        self.value = value
+
+
+def test_access_policy_service_matches_zylos_dm_contract_and_preserves_other_policy():
+    storage = MemoryStorage(
+        {"dm_policy": "owner", "dm_allowlist": ["a"], "group_policy": "open"}
+    )
+    service = AccessPolicyService(storage)
+
+    assert service.get_dm_access() == {
+        "dm_policy": "owner",
+        "dm_allowlist": ["a"],
+    }
+    assert service.set_dm_policy("allowlist") == {
+        "dm_policy": "allowlist",
+        "dm_allowlist": ["a"],
+    }
+    assert service.allow_dm_members(["a", "b", "b"])["dm_allowlist"] == ["a", "b"]
+    assert service.revoke_dm_members(["a"])["dm_allowlist"] == ["b"]
+    assert storage.value["group_policy"] == "open"
+
+    with pytest.raises(ValueError, match="open, allowlist, owner"):
+        service.set_dm_policy("closed")
+    with pytest.raises(ValueError, match="member_ids"):
+        service.allow_dm_members([])
+
+
+def test_comm_send_local_attachment_closes_upload_finalize_send_without_returning_url(
+    tmp_path,
+):
+    local = tmp_path / "report.pdf"
+    local.write_bytes(b"pdf!")
+    h = FakeHttp()
+
+    async def post(path, json=None):
+        h.calls.append(("POST", path, None, json))
+        if path.endswith("/uploads/prepare"):
+            return {
+                "upload_token": "secret-upload-token",
+                "upload_url": "https://presigned.invalid/put-secret",
+                "headers": {"x-secret": "value"},
+                "instant_upload": True,
+            }
+        if path == "/api/v1/conversations/uploads/finalize":
+            return {"media_id": "media-1", "artifact_id": "artifact-1"}
+        return {"id": "message-1", "conversation_id": "conv-1"}
+
+    h.post = post
+    receipt = run(
+        CommService(h).send_local_attachment(
+            "conv-1", str(local), caption="Quarterly report", reply_to="parent-1"
+        )
+    )
+
+    assert receipt == {
+        "sent": True,
+        "message_id": "message-1",
+        "conversation_id": "conv-1",
+        "artifact_id": "artifact-1",
+        "file_name": "report.pdf",
+        "content_type": "application/pdf",
+        "size_bytes": 4,
+    }
+    assert "presigned" not in repr(receipt)
+    assert [call[1] for call in h.calls] == [
+        "/api/v1/conversations/conv-1/uploads/prepare",
+        "/api/v1/conversations/uploads/finalize",
+        "/api/v1/conversations/conv-1/messages",
+    ]
+    sent = h.calls[-1][3]
+    assert sent["type"] == "FILE"
+    assert sent["parent_id"] == "parent-1"
+    assert sent["content"]["body"] == {
+        "file_name": "report.pdf",
+        "text": "Quarterly report",
+    }
+    assert sent["content"]["attachments"] == [
+        {
+            "artifact_id": "artifact-1",
+            "file_name": "report.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 4,
+        }
+    ]
+
+
+def test_native_schemas_expose_dm_management_and_attachment_closed_loop():
+    member_actions = tools.MEMBERS_SCHEMA["description"]
+    comm_actions = tools.COMM_SCHEMA["description"]
+    assert all(
+        action in member_actions
+        for action in ("dm_policy", "dm_list", "dm_allow", "dm_revoke")
+    )
+    assert "send_attachment" in comm_actions
+    assert "local_path" in tools.COMM_SCHEMA["parameters"]["properties"]
+
+
+def test_send_local_attachment_puts_bytes_when_upload_is_not_instant(
+    tmp_path, monkeypatch
+):
+    local = tmp_path / "note.txt"
+    local.write_bytes(b"hello")
+    h = FakeHttp({"id": "m", "conversation_id": "c"})
+    uploaded = {}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+    class UploadClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def put(self, url, content, headers):
+            uploaded.update(url=url, content=content, headers=headers)
+            return Response()
+
+    monkeypatch.setattr("httpx.AsyncClient", UploadClient)
+    h.result = {
+        "upload_token": "token",
+        "upload_url": "https://put",
+        "headers": {"x": "y"},
+    }
+    run(CommService(h).send_local_attachment("c", str(local)))
+    assert uploaded == {
+        "url": "https://put",
+        "content": b"hello",
+        "headers": {"x": "y"},
     }

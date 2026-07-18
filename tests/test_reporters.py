@@ -8,7 +8,12 @@ from cws_agent_sdk.codec import FRAME_SYSTEM, Frame
 from cws_agent_sdk.config import CwsConfig
 from cws_agent_sdk.http import CwsHttpClient
 from cws_agent_sdk.providers import FileStorage
-from cws_agent_sdk.reporters import BillingGate, MetricsReporter, OnlineReporter
+from cws_agent_sdk.reporters import (
+    BillingGate,
+    ChannelLivenessReporter,
+    MetricsReporter,
+    OnlineReporter,
+)
 from cws_agent_sdk.token import TokenManager
 
 
@@ -74,6 +79,41 @@ async def test_metrics_report_version_only():
     method, body = bodies[0]
     assert method == "PUT"
     assert body == {"version": "0.1.0"}
+
+
+@pytest.mark.asyncio
+async def test_channel_liveness_reports_openmax_channel_only():
+    bodies = []
+
+    def handler(request):
+        if request.url.path.endswith("/channel-liveness"):
+            import json
+
+            bodies.append(json.loads(request.content))
+            return httpx.Response(202, json={"data": {}})
+        raise AssertionError(request.url.path)
+
+    reporter = ChannelLivenessReporter(
+        _http_for(handler),
+        lambda: "me-1",
+        lambda: True,
+    )
+
+    assert await reporter.report_once() is True
+    assert bodies == [{"channels": [{"channel_type": "openmax", "online": True}]}]
+
+
+@pytest.mark.asyncio
+async def test_channel_liveness_skips_when_health_is_unknown():
+    reporter = ChannelLivenessReporter(
+        _http_for(
+            lambda request: (_ for _ in ()).throw(AssertionError(request.url.path))
+        ),
+        lambda: "me-1",
+        lambda: None,
+    )
+
+    assert await reporter.report_once() is False
 
 
 @pytest.mark.asyncio

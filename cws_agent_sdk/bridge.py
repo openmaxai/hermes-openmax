@@ -27,6 +27,7 @@ from .providers import FileStorage, Logger, StdLogger
 from .reporters import (
     OVERDUE_NOTICE,
     BillingGate,
+    ChannelLivenessReporter,
     MetricsReporter,
     OnlineReporter,
     RuntimeStateProvider,
@@ -100,6 +101,12 @@ class CwsBridge:
             lambda: self._cfg.member_id,
             version=version or cfg.client_version,
             runtime_state=runtime_state,
+            logger=self._log,
+        )
+        self._liveness = ChannelLivenessReporter(
+            self._http,
+            lambda: self._cfg.member_id,
+            self._channel_health,
             logger=self._log,
         )
         self._billing: Optional[BillingGate] = (
@@ -236,9 +243,15 @@ class CwsBridge:
         while self._running:
             try:
                 await self._metrics.report_once()
+                await self._liveness.report_once()
             except Exception as exc:  # noqa: BLE001 — reporting never breaks the loop
                 self._log.warn("metrics tick failed:", exc)
             await asyncio.sleep(self._metrics_interval_s)
+
+    def _channel_health(self) -> Optional[bool]:
+        if not self._running:
+            return None
+        return self._ws.is_open()
 
     def is_running(self) -> bool:
         return self._running and self._ws.is_open()

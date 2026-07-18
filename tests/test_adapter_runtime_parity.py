@@ -146,3 +146,45 @@ async def test_cws_priority_stays_in_metadata_when_message_event_has_no_priority
     event = adapter.events[0]
     assert not hasattr(event, "priority")
     assert event.metadata["cws_priority"] == "high"
+
+
+def test_source_uses_conversation_scoped_chat_type_for_session_routing():
+    adapter = _adapter()
+    source = adapter.build_source(
+        chat_id="conv-group-1",
+        chat_type="group",
+        user_id="user-1",
+    )
+
+    assert source.chat_id == "conv-group-1"
+    assert source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_group_members_share_one_conversation_scoped_source():
+    adapter = _adapter()
+    seen = []
+
+    async def capture(event):
+        seen.append(event)
+
+    adapter.handle_message = capture
+    for sender in ("user-1", "user-2"):
+        await adapter._on_inbound(
+            InboundMessage(
+                message_id=f"msg-{sender}",
+                conversation_id="group-1",
+                conversation_type="group",
+                org_id="org-1",
+                sender_id=sender,
+                sender_name=sender,
+                text="hello",
+            )
+        )
+    assert [
+        (event.source.chat_id, event.source.chat_type, event.source.user_id)
+        for event in seen
+    ] == [
+        ("group-1", "group", None),
+        ("group-1", "group", None),
+    ]

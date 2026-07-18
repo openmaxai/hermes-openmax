@@ -19,6 +19,61 @@ def _params(**values: Any) -> dict[str, Any]:
     }
 
 
+class AccessPolicyService:
+    """Local DM policy/allowlist management, matching zylos-openmax."""
+
+    _KEY = "policy.json"
+    _POLICIES = ("open", "allowlist", "owner")
+
+    def __init__(self, storage):
+        self._storage = storage
+
+    def _state(self) -> dict:
+        state = self._storage.read_json(self._KEY)
+        return dict(state) if isinstance(state, dict) else {}
+
+    def _write(self, state: dict) -> dict:
+        state["dm_policy"] = str(state.get("dm_policy") or "owner")
+        state["dm_allowlist"] = [str(v) for v in state.get("dm_allowlist") or []]
+        self._storage.write_json(self._KEY, state)
+        return {"dm_policy": state["dm_policy"], "dm_allowlist": state["dm_allowlist"]}
+
+    def get_dm_access(self) -> dict:
+        state = self._state()
+        return {
+            "dm_policy": str(state.get("dm_policy") or "owner"),
+            "dm_allowlist": [str(v) for v in state.get("dm_allowlist") or []],
+        }
+
+    def set_dm_policy(self, policy: str) -> dict:
+        policy = str(policy or "").lower()
+        if policy not in self._POLICIES:
+            raise ValueError("policy must be one of: open, allowlist, owner")
+        state = self._state()
+        state["dm_policy"] = policy
+        return self._write(state)
+
+    def allow_dm_members(self, member_ids: list[str]) -> dict:
+        ids = [str(v) for v in member_ids if str(v)]
+        if not ids:
+            raise ValueError("member_ids must contain at least one member")
+        state = self._state()
+        state["dm_allowlist"] = list(
+            dict.fromkeys([str(v) for v in state.get("dm_allowlist") or []] + ids)
+        )
+        return self._write(state)
+
+    def revoke_dm_members(self, member_ids: list[str]) -> dict:
+        ids = {str(v) for v in member_ids if str(v)}
+        if not ids:
+            raise ValueError("member_ids must contain at least one member")
+        state = self._state()
+        state["dm_allowlist"] = [
+            str(v) for v in state.get("dm_allowlist") or [] if str(v) not in ids
+        ]
+        return self._write(state)
+
+
 class CommService:
     def __init__(self, http: CwsHttpClient):
         self._http = http
@@ -219,6 +274,68 @@ class CommService:
             str(data.get("conversation_id", conversation_id)),
             data,
         )
+
+    async def send_local_attachment(
+        self,
+        conversation_id: str,
+        local_path: str,
+        *,
+        caption: str = "",
+        reply_to: Optional[str] = None,
+    ) -> dict:
+        """Upload, finalize, and send a local file; hide upload credentials."""
+        import mimetypes
+        import os
+        import httpx
+
+        if not os.path.isfile(local_path):
+            raise ValueError(f"file not found: {local_path}")
+        file_name = os.path.basename(local_path)
+        content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        size_bytes = os.path.getsize(local_path)
+        prep = await self._http.post(
+            f"/api/v1/conversations/{conversation_id}/uploads/prepare",
+            json={
+                "filename": file_name,
+                "content_type": content_type,
+                "size_bytes": size_bytes,
+            },
+        )
+        if not prep.get("instant_upload"):
+            upload_url = prep.get("upload_url")
+            if not upload_url:
+                raise ValueError("uploads/prepare returned no upload_url")
+            with open(local_path, "rb") as fh:
+                async with httpx.AsyncClient(timeout=300) as upload:
+                    response = await upload.put(
+                        upload_url, content=fh.read(), headers=prep.get("headers") or {}
+                    )
+                    response.raise_for_status()
+        finalized = await self._http.post(
+            "/api/v1/conversations/uploads/finalize",
+            json={"upload_token": prep["upload_token"]},
+        )
+        artifact_id = str(
+            finalized.get("artifact_id") or finalized.get("media_id") or ""
+        )
+        receipt = await self.send_attachment(
+            conversation_id,
+            artifact_id=artifact_id,
+            file_name=file_name,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            caption=caption,
+            reply_to=reply_to,
+        )
+        return {
+            "sent": True,
+            "message_id": receipt.message_id,
+            "conversation_id": receipt.conversation_id,
+            "artifact_id": artifact_id,
+            "file_name": file_name,
+            "content_type": content_type,
+            "size_bytes": size_bytes,
+        }
 
     # -- sync (offline compensation) ----------------------------------------
 

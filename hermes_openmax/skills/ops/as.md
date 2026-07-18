@@ -57,7 +57,7 @@
 
 ## 三步上传(工具内部自动完成)
 
-底层上传是 prepare → PUT → finalize 三步节奏,两条路径共用,只是命名空间不同。`workspace_artifacts` 的 `upload` / `kb_upload` 内部自动完成全部三步,你只需一次调用:
+底层上传是 prepare → PUT → finalize 三步节奏,两条路径共用,只是命名空间不同。`workspace_artifacts` 的 `upload` / `kb_upload` 内部自动完成全部三步,你只需一次调用;若要闭环发送到任意会话,直接用 `workspace_comm(action=send_attachment, conversation_id, local_path)`:
 
 ```
 本地文件

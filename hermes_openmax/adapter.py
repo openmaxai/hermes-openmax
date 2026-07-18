@@ -242,17 +242,23 @@ class CwsAdapter(BasePlatformAdapter):
         """SDK delivery callback. Raising here prevents the ack watermark
         from advancing, so the message is replayed via /sync later."""
         if msg.sender_type == "system":
-            if not hasattr(self, "_readonly_message_ids"):
-                self._readonly_message_ids = OrderedDict()
+            previous = getattr(self, "_readonly_message_ids", ())
+            if not isinstance(previous, OrderedDict):
+                self._readonly_message_ids = OrderedDict(
+                    (message_id, None) for message_id in previous
+                )
             self._readonly_message_ids[msg.message_id] = None
             self._readonly_message_ids.move_to_end(msg.message_id)
             while len(self._readonly_message_ids) > 1024:
                 self._readonly_message_ids.popitem(last=False)
+        # OpenMax groups are conversation-scoped. Do not pass the sender as the
+        # session participant, otherwise Hermes creates one session per member
+        # instead of one shared session per group.
         source = self.build_source(
             chat_id=msg.conversation_id,
             chat_name=msg.metadata.get("conversation_name") or None,
             chat_type="dm" if msg.conversation_type == "dm" else "group",
-            user_id=msg.sender_id or None,
+            user_id=(msg.sender_id or None) if msg.conversation_type == "dm" else None,
             user_name=msg.sender_name or None,
             is_bot=(msg.sender_type == "agent"),
             message_id=msg.message_id,
