@@ -27,7 +27,7 @@
 
 ## ⚠️ 最高纪律:给用户看图/文件,不用本工具
 
-**要在聊天里把图片/文件展示给用户,不要调用 workspace_artifacts** —— 直接在回复文本里写 `MEDIA:/绝对路径`,平台会把它作为原生图片消息投递。`resolve` 返回的预签名 URL 是**给你自己下载/读取用的**,几分钟就过期,**绝不允许把预签名 URL 粘贴进聊天**。
+**要在聊天里把图片/文件展示给用户,不要调用 workspace_artifacts**。单条图片+caption 用 `![caption](file:///absolute/path.png)`;纯图片或文件用 `MEDIA:/absolute/path`。`resolve` 返回的预签名 URL 是**给你自己下载/读取用的**,几分钟就过期,**绝不允许把预签名 URL 粘贴进聊天**。
 
 ## ⚠️ 该走哪条上传路径?IM 还是 KB?
 
@@ -37,7 +37,8 @@
 |---|---|---|
 | **在聊天/会话里发图片/文件**(用户↔agent) | **IM 上传** | `workspace_artifacts(action=upload, conversation_id, local_path)` — **必须带 conversation_id** |
 | **把材料归档进 KB**(项目交付物、研究笔记附件) | **KB 上传** | `workspace_artifacts(action=kb_upload, parent_id, local_path)` |
-| 给用户展示图片 | 都不是 | 回复文本里写 `MEDIA:/绝对路径`(见上) |
+| 给用户展示图片+说明 | 都不是 | `![caption](file:///absolute/path.png)`(单条原生图片消息) |
+| 给用户展示纯图片/文件 | 都不是 | `MEDIA:/absolute/path` |
 
 ### 服务端路径对比
 

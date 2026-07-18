@@ -6,6 +6,7 @@ Frame envelope (cws-comm internal/transport/ws/frame.go):
 The `message` frame is THIN: it carries id/seq/sender but normally no content —
 clients refetch the body over REST.
 """
+
 from __future__ import annotations
 
 import json
@@ -149,18 +150,18 @@ def new_client_msg_id() -> str:
 def looks_like_markdown(text: str) -> bool:
     """Port of zylos-openmax's outbound markdown heuristic — the FE renders
     content_type 'markdown' differently from plain 'text'."""
-    import re
 
     if not text:
         return False
     patterns = (
-        r"(^|\n)#{1,6}\s",          # headers
-        r"\*\*[^*\n]+\*\*",          # bold
-        r"(^|\n)\s*[-*+]\s+\S",      # bullet list
-        r"(^|\n)\s*\d+\.\s+\S",      # ordered list
-        r"```",                       # code fence
+        r"(^|\n)#{1,6}\s",  # headers
+        r"\*\*[^*\n]+\*\*",  # bold
+        r"(^|\n)\s*[-*+]\s+\S",  # bullet list
+        r"(^|\n)\s*\d+\.\s+\S",  # ordered list
+        r"```",  # code fence
         r"\[[^\]\n]+\]\([^)\n]+\)",  # link
-        r"(^|\n)>\s+\S",             # blockquote
-        r"`[^`\n]+`",                # inline code
+        r"(^|\n)>\s+\S",  # blockquote
+        r"(^|\n)\|\s*[^\n|]+\s*\|",  # table row (zylos parity)
+        r"`[^`\n]+`",  # inline code
     )
     return any(re.search(p, text) for p in patterns)

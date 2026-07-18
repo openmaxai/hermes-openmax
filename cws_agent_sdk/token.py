@@ -7,6 +7,7 @@ Contract (cws-core internal/transport/http/auth.go):
   POST /auth/ws-ticket     Bearer JWT  {}                -> {ticket, expires_at}   (one-shot, 30 s)
 All responses are D8 envelopes; payload lives under "data".
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -35,8 +36,12 @@ def _unwrap_d8(resp: httpx.Response) -> Any:
     msg = err.get("detail") or err.get("title") or resp.text[:200]
     code = err.get("code") or ""
     if resp.status_code in (401, 403):
-        raise CwsAuthError(f"{resp.status_code} {code}: {msg}", status=resp.status_code, body=body)
-    raise CwsApiError(f"{resp.status_code} {code}: {msg}", status=resp.status_code, body=body)
+        raise CwsAuthError(
+            f"{resp.status_code} {code}: {msg}", status=resp.status_code, body=body
+        )
+    raise CwsApiError(
+        f"{resp.status_code} {code}: {msg}", status=resp.status_code, body=body
+    )
 
 
 class TokenManager:
@@ -85,14 +90,19 @@ class TokenManager:
 
     async def get_access_token(self) -> str:
         async with self._lock:
-            if self._access_token and time.time() < self._access_expires_at - _EARLY_REFRESH_S:
+            if (
+                self._access_token
+                and time.time() < self._access_expires_at - _EARLY_REFRESH_S
+            ):
                 return self._access_token
             if self._refresh_token:
                 try:
                     await self._refresh()
                     return self._access_token
                 except (CwsAuthError, CwsApiError) as exc:
-                    self._log.warn("refresh failed, falling back to api-key exchange:", exc)
+                    self._log.warn(
+                        "refresh failed, falling back to api-key exchange:", exc
+                    )
             await self._exchange()
             return self._access_token
 
@@ -165,7 +175,12 @@ async def register_agent(bff_url: str, *, timeout_s: float = 30.0) -> dict:
 
 
 async def accept_invitation(
-    bff_url: str, access_token: str, invitation_id: str, invite_token: str, *, timeout_s: float = 30.0
+    bff_url: str,
+    access_token: str,
+    invitation_id: str,
+    invite_token: str,
+    *,
+    timeout_s: float = 30.0,
 ) -> dict:
     """Accept an org invitation. Returns {member_id, org_id, role_slug}."""
     async with httpx.AsyncClient(timeout=timeout_s) as http:

@@ -44,7 +44,16 @@
 | 发消息 | 发文本/Markdown 消息,可回复某条消息 | `workspace_comm(action=send, conversation_id, text, reply_to?)` |
 | 拉历史 | 拉历史消息列表 | `workspace_comm(action=history, conversation_id, limit?)` |
 
-`send` 成功返回 `{sent:true, message_id}`。文本内容支持 Markdown。要发图片/文件给用户时,**不走 send 引用附件**,直接在回复文本里写 `MEDIA:/绝对路径`(见 `ops/as.md` 最高纪律);`workspace_artifacts(upload)` 拿到的 media_id 主要用于把文件挂进会话记录。
+`send` 成功返回 `{sent:true, message_id}`。文本内容支持 Markdown(标题、列表、表格、链接、
+引用、行内代码和 fenced code block 会自动以 `content_type=markdown` 发送)。要发媒体给用户时,
+**不要用 `workspace_comm(send)` 伪造附件**:
+
+- 单条图片 + caption:`![caption](file:///absolute/path.png)`
+- 只发图片/文件:`MEDIA:/absolute/path`
+
+本地路径必须是已存在的绝对路径。`workspace_artifacts(upload)` 拿到的 media_id 主要用于
+归档/挂入会话记录,不是最终回复里展示本地媒体的替代品。详见 workspace Skill 的
+「发送图片/文件」与 `ops/as.md`。
 
 **当前工具未暴露,如需要请告知 owner**:comm.get_message(单条消息详情)、结构化 content 数组(如 `[{type:"file", body:"<media_id>"}]` 多段消息)、clientMsgId 幂等重试参数(源系统用它做 5 分钟服务端去重;当前重发同一逻辑消息时注意可能产生重复)、seq 区间拉取(after_seq / before_seq;当前 history 只有 limit)。
 
@@ -86,7 +95,8 @@ cws-core 是 agent owner 的权威来源(可通过 transfer-owner 转移,由 own
 1. 先上传附件(IM 模式,带 conversation_id),拿 media_id
    workspace_artifacts(action=upload, conversation_id="<conv-uuid>", local_path="/tmp/weekly.pdf")
 
-2. 发消息说明;要直接展示给用户时在文本里写 MEDIA:/tmp/weekly.pdf
+2. 发消息说明;要直接展示文件给用户时在最终回复里写 MEDIA:/tmp/weekly.pdf。
+   若是图片且说明必须同一条,改用 ![本周周报](file:///tmp/weekly.png)
    workspace_comm(action=send, conversation_id="<conv-uuid>", text="本周周报见附件")
 ```
 

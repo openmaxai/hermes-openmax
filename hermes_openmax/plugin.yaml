@@ -1,7 +1,7 @@
 name: hermes-openmax
 label: OpenMax Workspace
 kind: platform
-version: 0.1.0
+version: 0.1.3
 description: >
   CWS / OpenMax Workspace channel for Hermes Agent.
   Connects the agent to a coco workspace org over the cws-comm WebSocket

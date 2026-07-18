@@ -3,6 +3,7 @@
 MVP scope: the comm surface (messages / read / sync). tm/kb/as clients can be
 added behind the same CwsHttpClient later.
 """
+
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -10,6 +11,12 @@ from typing import Any, Optional
 from .codec import new_client_msg_id
 from .http import CwsHttpClient
 from .types import SendReceipt
+
+
+def _params(**values: Any) -> dict[str, Any]:
+    return {
+        key: value for key, value in values.items() if value is not None and value != ""
+    }
 
 
 class CommService:
@@ -36,7 +43,11 @@ class CommService:
         body: dict[str, Any] = {
             "client_msg_id": client_msg_id or new_client_msg_id(),
             "type": "AGENT_TEXT",
-            "content": {"content_type": content_type, "body": {"text": text}, "attachments": []},
+            "content": {
+                "content_type": content_type,
+                "body": {"text": text},
+                "attachments": [],
+            },
             "priority": priority,
         }
         if reply_to:
@@ -125,10 +136,17 @@ class CommService:
 
     async def edit_message(self, message_id: str | int, text: str) -> dict:
         """Replace own message content (15-min server-side edit window)."""
+        from .codec import looks_like_markdown
+
         return await self._http.request(
             "PUT",
             f"/api/v1/messages/{message_id}",
-            json={"content": {"content_type": "text", "body": {"text": text}}},
+            json={
+                "content": {
+                    "content_type": "markdown" if looks_like_markdown(text) else "text",
+                    "body": {"text": text},
+                }
+            },
         )
 
     # -- reactions ---------------------------------------------------------
@@ -154,6 +172,53 @@ class CommService:
             json={"read_until_seq": int(read_until_seq)},
         )
         return int(data.get("read_until_seq", read_until_seq))
+
+    async def get_unread(self, conversation_id: str) -> dict:
+        return await self._http.get(f"/api/v1/conversations/{conversation_id}/unread")
+
+    async def send_attachment(
+        self,
+        conversation_id: str,
+        *,
+        artifact_id: str,
+        file_name: str,
+        content_type: str,
+        size_bytes: int,
+        caption: str = "",
+        reply_to: Optional[str] = None,
+        client_msg_id: Optional[str] = None,
+    ) -> SendReceipt:
+        kind = "IMAGE" if content_type.startswith("image/") else "FILE"
+        body: dict[str, Any] = {
+            "client_msg_id": client_msg_id or new_client_msg_id(),
+            "type": kind,
+            "content": {
+                "content_type": kind.lower(),
+                "body": {
+                    "file_name": file_name,
+                    **({"text": caption} if caption else {}),
+                },
+                "attachments": [
+                    {
+                        "artifact_id": artifact_id,
+                        "file_name": file_name,
+                        "content_type": content_type,
+                        "size_bytes": int(size_bytes),
+                    }
+                ],
+            },
+            "priority": 3,
+        }
+        if reply_to:
+            body["parent_id"] = str(reply_to)
+        data = await self._http.post(
+            f"/api/v1/conversations/{conversation_id}/messages", json=body
+        )
+        return SendReceipt(
+            str(data.get("id", "")),
+            str(data.get("conversation_id", conversation_id)),
+            data,
+        )
 
     # -- sync (offline compensation) ----------------------------------------
 
@@ -183,11 +248,18 @@ class CommService:
         )
 
     async def list_conversations(
-        self, limit: int = 50, *, include_archived: bool = False, search_name: str = ""
+        self,
+        limit: int = 50,
+        *,
+        cursor: Optional[str] = None,
+        include_archived: bool = False,
+        search_name: str = "",
     ) -> list[dict]:
         """Rows are userConversationItem: {conversation, unread_count,
         unread_mention, is_pinned, is_muted, last_read_seq, ...}."""
         params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
         if include_archived:
             params["include_archived"] = True
         if search_name:
@@ -196,7 +268,12 @@ class CommService:
         return items
 
     async def create_group(
-        self, name: str, member_ids: list[str], *, description: str = "", metadata: Optional[dict] = None
+        self,
+        name: str,
+        member_ids: list[str],
+        *,
+        description: str = "",
+        metadata: Optional[dict] = None,
     ) -> dict:
         body: dict[str, Any] = {"name": name, "member_ids": member_ids}
         if description:
@@ -221,7 +298,11 @@ class CoreService:
         return await self._http.get(f"/api/v1/members/{member_id}")
 
     async def list_members(
-        self, *, kind: Optional[str] = None, search: Optional[str] = None, limit: int = 50
+        self,
+        *,
+        kind: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 50,
     ) -> list[dict]:
         params: dict[str, Any] = {"limit": limit}
         if kind:
@@ -233,20 +314,34 @@ class CoreService:
 
     async def set_display_name(self, display_name: str) -> dict:
         return await self._http.request(
-            "PATCH", "/api/v1/me/display-name", json={"display_name": display_name}
+            "PATCH", "/api/v1/me", json={"display_name": display_name}
         )
 
     async def list_agent_profiles(
-        self, *, project_id: str = "", member_id: str = "", limit: int = 50
+        self,
+        *,
+        project_id: str = "",
+        member_id: str = "",
+        member_ids: Optional[list[str]] = None,
+        include: Optional[list[str]] = None,
+        capabilities: bool = False,
+        limit: Optional[int] = None,
     ) -> list[dict]:
-        """Agent capability profiles (skills + tags + description + online) —
-        MUST be consulted before assigning steps to agents (guardrail).
-        Server requires a scope: project_id and/or member_id."""
-        params: dict[str, Any] = {"limit": limit}
+        ids = list(member_ids or ([] if not member_id else [member_id]))
+        if not project_id and not ids:
+            raise ValueError("agent_profiles requires an explicit project/member scope")
+        params: dict[str, Any] = {}
         if project_id:
             params["project_id"] = project_id
-        if member_id:
-            params["member_id"] = member_id
+        if ids:
+            params["member_id"] = ids
+        includes = list(include or [])
+        if capabilities and "capabilities" not in includes:
+            includes.append("capabilities")
+        if includes:
+            params["include"] = includes
+        if limit is not None:
+            params["limit"] = limit
         items, _ = await self._http.get_page("/api/v1/agent-profiles", params=params)
         return items
 
@@ -254,9 +349,55 @@ class CoreService:
         items, _ = await self._http.get_page("/api/v1/organizations")
         return items
 
+    async def get_organization(self, org_id: str) -> dict:
+        return await self._http.get(f"/api/v1/organizations/{org_id}")
+
+    async def create_organization(self, body: dict) -> dict:
+        return await self._http.post("/api/v1/organizations", json=body)
+
+    async def switch_organization(self, org_id: str) -> dict:
+        return await self._http.post(f"/api/v1/organizations/{org_id}/switch", json={})
+
     async def list_roles(self) -> list[dict]:
         items, _ = await self._http.get_page("/api/v1/roles")
         return items
+
+    async def create_invitation(self, body: dict) -> dict:
+        return await self._http.post("/api/v1/invitations", json=body)
+
+    async def list_invitations(
+        self, *, status=None, page=None, page_size=None, order_by=None
+    ) -> list[dict]:
+        items, _ = await self._http.get_page(
+            "/api/v1/invitations",
+            params=_params(
+                status=status, page=page, page_size=page_size, order_by=order_by
+            ),
+        )
+        return items
+
+    async def accept_invitation(self, invitation_id: str, token: str) -> dict:
+        return await self._http.post(
+            f"/api/v1/invitations/{invitation_id}/accept", json={"token": token}
+        )
+
+    async def revoke_invitation(self, invitation_id: str) -> None:
+        await self._http.request("DELETE", f"/api/v1/invitations/{invitation_id}")
+
+    async def get_onboarding_session(self) -> dict:
+        return await self._http.get("/api/v1/onboarding/session")
+
+    async def report_onboarding_event(self, body: dict) -> dict:
+        return await self._http.post("/api/v1/onboarding/events", json=body)
+
+    async def create_platform_agent(self, body: dict) -> dict:
+        return await self._http.post("/api/v1/platform-agents", json=body)
+
+    async def delete_platform_agent(self, member_id: str) -> None:
+        await self._http.request("DELETE", f"/api/v1/platform-agents/{member_id}")
+
+    async def get_agent_domain(self, identity_id: str) -> dict:
+        return await self._http.get(f"/api/v1/platform-agents/{identity_id}/domain")
 
 
 class TmService:
@@ -265,35 +406,54 @@ class TmService:
     def __init__(self, http: CwsHttpClient):
         self._http = http
 
-    async def list_projects(self, limit: int = 50) -> list[dict]:
-        items, _ = await self._http.get_page("/api/v1/projects", params={"limit": limit})
+    async def list_projects(
+        self,
+        limit: Optional[int] = None,
+        *,
+        status=None,
+        query=None,
+        page=None,
+        page_size=None,
+        order_by=None,
+    ) -> list[dict]:
+        if page_size is None:
+            page_size = limit
+        items, _ = await self._http.get_page(
+            "/api/v1/projects",
+            params=_params(
+                status=status,
+                query=query,
+                page=page,
+                page_size=page_size,
+                order_by=order_by,
+            ),
+        )
         return items
 
-    async def create_project(self, name: str, lead_member_id: str, *, description: str = "") -> dict:
-        body: dict[str, Any] = {"name": name, "lead_member_id": lead_member_id}
-        if description:
-            body["description"] = description
+    async def create_project(self, body: dict) -> dict:
         return await self._http.post("/api/v1/projects", json=body)
 
     async def get_project(self, project_id: str) -> dict:
         return await self._http.get(f"/api/v1/projects/{project_id}")
 
     async def update_project(self, project_id: str, body: dict) -> dict:
-        return await self._http.request("PATCH", f"/api/v1/projects/{project_id}", json=body)
+        return await self._http.request(
+            "PATCH", f"/api/v1/projects/{project_id}", json=body
+        )
 
     async def archive_project(self, project_id: str) -> dict:
         return await self._http.post(f"/api/v1/projects/{project_id}/archive")
-
-    async def restore_project(self, project_id: str) -> dict:
-        return await self._http.post(f"/api/v1/projects/{project_id}/restore")
 
     async def list_project_members(self, project_id: str) -> list[dict]:
         items, _ = await self._http.get_page(f"/api/v1/projects/{project_id}/members")
         return items
 
-    async def add_project_member(self, project_id: str, member_id: str) -> dict:
+    async def add_project_member(
+        self, project_id: str, member_id: str, *, role: str = "member"
+    ) -> dict:
         return await self._http.post(
-            f"/api/v1/projects/{project_id}/members", json={"member_id": member_id}
+            f"/api/v1/projects/{project_id}/members",
+            json={"member_id": member_id, "role": role},
         )
 
     async def remove_project_member(self, project_id: str, member_id: str) -> None:
@@ -307,9 +467,15 @@ class TmService:
     async def get_event_binding(self, event_binding_id: str) -> dict:
         return await self._http.get(f"/api/v1/event-bindings/{event_binding_id}")
 
-    async def list_issues(self, project_id: Optional[str] = None, limit: int = 50) -> list[dict]:
-        path = f"/api/v1/projects/{project_id}/issues" if project_id else "/api/v1/issues"
-        items, _ = await self._http.get_page(path, params={"limit": limit})
+    async def list_issues(
+        self, project_id: Optional[str] = None, limit: Optional[int] = None, **filters
+    ) -> list[dict]:
+        path = (
+            f"/api/v1/projects/{project_id}/issues" if project_id else "/api/v1/issues"
+        )
+        if filters.get("page_size") is None:
+            filters["page_size"] = limit
+        items, _ = await self._http.get_page(path, params=_params(**filters))
         return items
 
     async def get_issue(self, issue_id: str) -> dict:
@@ -320,16 +486,30 @@ class TmService:
         return await self._http.post(f"/api/v1/projects/{project_id}/issues", json=body)
 
     async def update_issue(self, issue_id: str, body: dict) -> dict:
-        return await self._http.request("PATCH", f"/api/v1/issues/{issue_id}", json=body)
+        return await self._http.request(
+            "PATCH", f"/api/v1/issues/{issue_id}", json=body
+        )
 
-    async def issue_action(self, issue_id: str, action: str, body: Optional[dict] = None) -> dict:
+    async def issue_action(
+        self, issue_id: str, action: str, body: Optional[dict] = None
+    ) -> dict:
         """action: activate | submit-plan | accept-plan | deliver | resume |
         terminate | accept-delivered | reassign-owner | move"""
-        return await self._http.post(f"/api/v1/issues/{issue_id}/{action}", json=body or {})
+        return await self._http.post(
+            f"/api/v1/issues/{issue_id}/{action}", json=body or {}
+        )
 
-    async def list_tasks(self, issue_id: Optional[str] = None, limit: int = 50) -> list[dict]:
-        path = f"/api/v1/issues/{issue_id}/tasks" if issue_id else "/api/v1/tasks"
-        items, _ = await self._http.get_page(path, params={"limit": limit})
+    async def list_tasks(
+        self, issue_id: Optional[str] = None, limit: Optional[int] = None, **filters
+    ) -> list[dict]:
+        # Keep the flat collection endpoint so project_id + issue_id + status
+        # filters can be combined exactly like zylos tm.js.
+        path = "/api/v1/tasks"
+        if filters.get("page_size") is None:
+            filters["page_size"] = limit
+        if issue_id:
+            filters["issue_id"] = issue_id
+        items, _ = await self._http.get_page(path, params=_params(**filters))
         return items
 
     async def create_task(self, project_id: str, issue_id: str, body: dict) -> dict:
@@ -337,24 +517,39 @@ class TmService:
             f"/api/v1/projects/{project_id}/issues/{issue_id}/tasks", json=body
         )
 
-    async def task_action(self, task_id: str, action: str, body: Optional[dict] = None) -> dict:
+    async def task_action(
+        self, task_id: str, action: str, body: Optional[dict] = None
+    ) -> dict:
         """action: transition | claim | start | reassign"""
-        return await self._http.post(f"/api/v1/tasks/{task_id}/{action}", json=body or {})
+        return await self._http.post(
+            f"/api/v1/tasks/{task_id}/{action}", json=body or {}
+        )
 
     # -- comments (work_type: issue|task) -----------------------------------
 
-    async def create_comment(self, work_type: str, work_id: str, body_markdown: str) -> dict:
+    async def create_comment(
+        self, work_type: str, work_id: str, body_markdown: str
+    ) -> dict:
         return await self._http.post(
             "/api/v1/comments",
-            json={"work_type": work_type, "work_id": work_id, "body_markdown": body_markdown},
+            json={
+                "work_type": work_type,
+                "work_id": work_id,
+                "body_markdown": body_markdown,
+            },
         )
 
-    async def list_comments(self, work_type: str, work_id: str, limit: int = 50) -> list[dict]:
+    async def list_comments(
+        self, work_type: str, work_id: str, limit: int = 50
+    ) -> list[dict]:
         items, _ = await self._http.get_page(
             "/api/v1/comments",
             params={"work_type": work_type, "work_id": work_id, "limit": limit},
         )
         return items
+
+    async def get_comment(self, comment_id: str) -> dict:
+        return await self._http.get(f"/api/v1/comments/{comment_id}")
 
     # -- work references (proj://<id> / issue://<id>) -------------------------
 
@@ -372,15 +567,27 @@ class TmService:
 
     # -- blueprints -----------------------------------------------------------
 
-    async def create_blueprint(self, issue_id: str, steps: list[dict], *, notes: str = "") -> dict:
+    async def create_blueprint(
+        self,
+        issue_id: str,
+        steps: list[dict],
+        *,
+        estimated_budget: Any = None,
+        notes: str = "",
+    ) -> dict:
         body: dict[str, Any] = {"steps": steps}
         if notes:
             body["notes"] = notes
+        if estimated_budget is not None:
+            body["estimated_budget"] = estimated_budget
         return await self._http.post(f"/api/v1/issues/{issue_id}/blueprints", json=body)
 
-    async def get_blueprint(self, blueprint_id: str, *, include_steps: bool = True) -> dict:
+    async def get_blueprint(
+        self, blueprint_id: str, *, include_steps: bool = True
+    ) -> dict:
         return await self._http.get(
-            f"/api/v1/blueprints/{blueprint_id}", params={"include_steps": include_steps}
+            f"/api/v1/blueprints/{blueprint_id}",
+            params={"include_steps": include_steps},
         )
 
     async def list_blueprints(self, issue_id: str) -> list[dict]:
@@ -388,7 +595,9 @@ class TmService:
         return items
 
     async def submit_blueprint(self, blueprint_id: str) -> dict:
-        return await self._http.post(f"/api/v1/blueprints/{blueprint_id}/submit-for-approval")
+        return await self._http.post(
+            f"/api/v1/blueprints/{blueprint_id}/submit-for-approval"
+        )
 
     async def set_blueprint_steps(self, blueprint_id: str, steps: list[dict]) -> dict:
         return await self._http.request(
@@ -405,19 +614,36 @@ class TmService:
         items, _ = await self._http.get_page(f"/api/v1/tasks/{task_id}/attempts")
         return items
 
+    async def get_attempt(self, attempt_id: str) -> dict:
+        return await self._http.get(f"/api/v1/attempts/{attempt_id}")
+
     async def transition_attempt(
-        self, attempt_id: str, target_status: str, *, failure_reason: str = ""
+        self,
+        attempt_id: str,
+        target_status: str,
+        *,
+        failure_reason: str = "",
+        blocked_on_approval_request_ids: Optional[list[str]] = None,
     ) -> dict:
         """target_status: done | failed | blocked | cancelled (terminal only)."""
         body: dict[str, Any] = {"target_status": target_status}
         if failure_reason:
             body["failure_reason"] = failure_reason
-        return await self._http.post(f"/api/v1/attempts/{attempt_id}/transition", json=body)
+        if blocked_on_approval_request_ids is not None:
+            body["blocked_on_approval_request_ids"] = blocked_on_approval_request_ids
+        return await self._http.post(
+            f"/api/v1/attempts/{attempt_id}/transition", json=body
+        )
 
     # -- event bindings (v0.7: timer -> create issue from template) -------------
 
     async def create_event_binding(
-        self, cron_expr: str, lead_member_id: str, spec: dict, *, owner_member_id: str = ""
+        self,
+        cron_expr: str,
+        lead_member_id: str,
+        spec: dict,
+        *,
+        owner_member_id: str = "",
     ) -> dict:
         body: dict[str, Any] = {
             "cron_expr": cron_expr,
@@ -442,6 +668,24 @@ class KbService:
     def __init__(self, http: CwsHttpClient):
         self._http = http
 
+    async def init_kb(self) -> dict:
+        return await self._http.post("/api/v1/kbs/init")
+
+    async def get_kb(self, kb_id: str) -> dict:
+        return await self._http.get(f"/api/v1/kbs/{kb_id}")
+
+    async def update_kb(self, kb_id: str, body: dict) -> dict:
+        return await self._http.request("PATCH", f"/api/v1/kbs/{kb_id}", json=body)
+
+    async def delete_kb(self, kb_id: str) -> None:
+        await self._http.request("DELETE", f"/api/v1/kbs/{kb_id}")
+
+    async def archive_kb(self, kb_id: str) -> dict:
+        return await self._http.post(f"/api/v1/kbs/{kb_id}/archive")
+
+    async def unarchive_kb(self, kb_id: str) -> dict:
+        return await self._http.post(f"/api/v1/kbs/{kb_id}/unarchive")
+
     async def list_kbs(self, limit: int = 50) -> list[dict]:
         items, _ = await self._http.get_page("/api/v1/kbs", params={"limit": limit})
         return items
@@ -460,21 +704,35 @@ class KbService:
         items, _ = await self._http.get_page(f"/api/v1/pages/{page_id}/references")
         return items
 
-    async def create_file_node(self, kb_id: str, name: str, artifact_id: str, parent_id: str = "") -> dict:
+    async def create_file_node(
+        self, kb_id: str, name: str, artifact_id: str, parent_id: str = ""
+    ) -> dict:
         body: dict[str, Any] = {"name": name, "artifact_id": artifact_id}
         if parent_id:
             body["parent_id"] = parent_id
         return await self._http.post(f"/api/v1/kbs/{kb_id}/tree/files", json=body)
 
-    async def batch_download(self, kb_id: str, node_ids: list[str]) -> list[dict]:
+    async def batch_download(
+        self, kb_id: str, node_ids: list[str], *, inline: bool = False
+    ) -> list[dict]:
         data = await self._http.post(
             f"/api/v1/kbs/{kb_id}/tree/files/batch-download",
-            json={"node_ids": node_ids, "inline": False},
+            json={"node_ids": node_ids, "inline": inline},
         )
         return data if isinstance(data, list) else data.get("items", [])
 
-    async def search_pages(self, query: str, *, kb_id: Optional[str] = None, limit: int = 20) -> list[dict]:
-        params: dict[str, Any] = {"query": query, "limit": limit}
+    async def search_pages(
+        self,
+        query: str,
+        *,
+        kb_id: Optional[str] = None,
+        limit: int = 20,
+        offset=None,
+        sort=None,
+    ) -> list[dict]:
+        params: dict[str, Any] = _params(
+            query=query, limit=limit, offset=offset, sort=sort
+        )
         if kb_id:
             params["kb_id"] = kb_id
         items, _ = await self._http.get_page("/api/v1/search/pages", params=params)
@@ -495,7 +753,29 @@ class KbService:
         )
 
     async def get_tree(self, kb_id: str) -> dict:
-        return await self._http.get(f"/api/v1/kbs/{kb_id}/tree")
+        return await self._http.get(f"/api/v1/kbs/{kb_id}/tree/roots")
+
+    async def get_node(self, kb_id: str, node_id: str) -> dict:
+        return await self._http.get(f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}")
+
+    async def get_breadcrumb(self, kb_id: str, node_id: str) -> dict:
+        return await self._http.get(
+            f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/breadcrumb"
+        )
+
+    async def list_children(self, kb_id: str, node_id: str) -> dict:
+        return await self._http.get(
+            f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/children"
+        )
+
+    async def preview_node(self, kb_id: str, node_id: str) -> dict:
+        return await self._http.get(f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/preview")
+
+    async def list_pages(self, *, cursor=None, limit=20, offset=None) -> list[dict]:
+        items, _ = await self._http.get_page(
+            "/api/v1/pages", params=_params(cursor=cursor, limit=limit, offset=offset)
+        )
+        return items
 
     # -- revisions --------------------------------------------------------------
 
@@ -508,7 +788,9 @@ class KbService:
     async def get_revision(self, page_id: str, revision_id: int) -> dict:
         return await self._http.get(f"/api/v1/pages/{page_id}/revisions/{revision_id}")
 
-    async def diff_revisions(self, page_id: str, from_revision: int, to_revision: int) -> dict:
+    async def diff_revisions(
+        self, page_id: str, from_revision: int, to_revision: int
+    ) -> dict:
         return await self._http.get(
             f"/api/v1/pages/{page_id}/revisions/diff",
             params={"from_revision": from_revision, "to_revision": to_revision},
@@ -528,7 +810,9 @@ class KbService:
         return await self._http.post(f"/api/v1/pages/{page_id}/restore")
 
     async def list_trashed(self, limit: int = 50) -> list[dict]:
-        items, _ = await self._http.get_page("/api/v1/pages/trashed", params={"limit": limit})
+        items, _ = await self._http.get_page(
+            "/api/v1/pages/trashed", params={"limit": limit}
+        )
         return items
 
     async def freeze_page(self, page_id: str) -> dict:
@@ -544,19 +828,28 @@ class KbService:
 
     async def rename_node(self, kb_id: str, node_id: str, name: str) -> None:
         await self._http.request(
-            "PATCH", f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/rename", json={"name": name}
+            "PATCH",
+            f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/rename",
+            json={"name": name},
         )
 
     async def move_node(self, kb_id: str, node_id: str, parent_id: str = "") -> None:
         body = {"parent_id": parent_id} if parent_id else {}
-        await self._http.post(f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/move", json=body)
+        await self._http.post(
+            f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/move", json=body
+        )
 
     async def delete_node(self, kb_id: str, node_id: str) -> None:
         await self._http.request("DELETE", f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}")
 
-    async def download_node(self, kb_id: str, node_id: str) -> dict:
+    async def download_node(
+        self, kb_id: str, node_id: str, *, inline: bool = False
+    ) -> dict:
         """Returns {node_id, name, download_url(presigned), content_type, ...}."""
-        return await self._http.get(f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/download")
+        return await self._http.get(
+            f"/api/v1/kbs/{kb_id}/tree/nodes/{node_id}/download",
+            params={"inline": inline},
+        )
 
 
 class AsService:
@@ -571,14 +864,32 @@ class AsService:
             "/api/v1/artifacts/resolve", json={"uris": uris, "inline": inline}
         )
 
+    async def get_url(self, artifact_id_or_uri: str, *, inline: bool = False) -> dict:
+        uri = (
+            artifact_id_or_uri
+            if artifact_id_or_uri.startswith("artifact://")
+            else f"artifact://{artifact_id_or_uri}"
+        )
+        data = await self.resolve_uris([uri], inline=inline)
+        entry = (data.get("resolved") or {}).get(uri)
+        if not entry or not entry.get("download_url"):
+            raise ValueError(f"artifact not resolvable: {uri}")
+        return {
+            "url": entry["download_url"],
+            "expires_at": entry.get("expires_at"),
+            "content_type": entry.get("content_type"),
+            "content_length": entry.get("content_length"),
+            "name": entry.get("name"),
+        }
+
     async def prepare_kb_upload(
-        self, parent_id: str, filename: str, content_type: str, size_bytes: int
+        self, filename: str, content_type: str, size_bytes: int, parent_id: str = ""
     ) -> dict:
         """Returns {upload_token, upload_url, headers, expires_at, instant_upload}."""
         return await self._http.post(
             "/api/v1/uploads/prepare",
             json={
-                "parent_id": parent_id,
+                **({"parent_id": parent_id} if parent_id else {}),
                 "filename": filename,
                 "content_type": content_type,
                 "size_bytes": size_bytes,
@@ -586,20 +897,39 @@ class AsService:
         )
 
     async def finalize_kb_upload(self, upload_token: str) -> dict:
-        return await self._http.post("/api/v1/uploads/finalize", json={"upload_token": upload_token})
+        return await self._http.post(
+            "/api/v1/uploads/finalize", json={"upload_token": upload_token}
+        )
 
     async def prepare_conversation_upload(
         self, conversation_id: str, filename: str, content_type: str, size_bytes: int
     ) -> dict:
         return await self._http.post(
             f"/api/v1/conversations/{conversation_id}/uploads/prepare",
-            json={"filename": filename, "content_type": content_type, "size_bytes": size_bytes},
+            json={
+                "filename": filename,
+                "content_type": content_type,
+                "size_bytes": size_bytes,
+            },
         )
 
     async def finalize_conversation_upload(self, upload_token: str) -> dict:
         return await self._http.post(
-            "/api/v1/conversations/uploads/finalize", json={"upload_token": upload_token}
+            "/api/v1/conversations/uploads/finalize",
+            json={"upload_token": upload_token},
         )
+
+    async def download(self, url: str, filename: str, *, storage=None) -> str:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+        if storage is None:
+            return ""
+        relative = f"media/{filename}"
+        storage.write(relative, response.content)
+        return storage.path_for(relative) if hasattr(storage, "path_for") else ""
 
 
 class ConnService:
@@ -614,7 +944,9 @@ class ConnService:
         )
         return items
 
-    async def acquire_credential(self, connection_id: str, agent_member_id: str) -> dict:
+    async def acquire_credential(
+        self, connection_id: str, agent_member_id: str
+    ) -> dict:
         """Returns {credential_mode, access_token, token_type, expires_at, proxy_*, toolkits}."""
         return await self._http.post(
             f"/api/v1/connect/connections/{connection_id}/credential",

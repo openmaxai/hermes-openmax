@@ -1,4 +1,5 @@
 """Bridge behavior: normalization, echo suppression, delivery invariant."""
+
 import pytest
 
 from cws_agent_sdk.bridge import CwsBridge
@@ -52,7 +53,10 @@ def make_bridge(tmp_path, on_message, member_id="me-1"):
         member_id=member_id,
     )
     bridge = CwsBridge(
-        cfg, storage=FileStorage(tmp_path), on_message=on_message, billing_gate_enabled=False
+        cfg,
+        storage=FileStorage(tmp_path),
+        on_message=on_message,
+        billing_gate_enabled=False,
     )
     bridge.comm = FakeComm()
     return bridge
@@ -62,7 +66,12 @@ def msg_frame(msg_id=1, conv="conv-1", seq=10, sender="user-7"):
     return Frame(
         type=FRAME_MESSAGE,
         org_id="org-1",
-        payload={"id": msg_id, "conversation_id": conv, "seq": seq, "sender_id": sender},
+        payload={
+            "id": msg_id,
+            "conversation_id": conv,
+            "seq": seq,
+            "sender_id": sender,
+        },
     )
 
 

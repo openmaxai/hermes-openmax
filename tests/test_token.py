@@ -41,7 +41,9 @@ async def test_exchange_and_cache():
             }
         )
 
-    tm = TokenManager(_cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    tm = TokenManager(
+        _cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
     assert await tm.get_access_token() == "jwt-1"
     assert await tm.get_access_token() == "jwt-1"  # cached, no 2nd call
     assert len(calls) == 1
@@ -63,7 +65,9 @@ async def test_refresh_path_used_after_invalidate():
             return _d8({"access_token": "jwt-2", "refresh_token": "rt-2"})
         raise AssertionError(request.url.path)
 
-    tm = TokenManager(_cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    tm = TokenManager(
+        _cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
     assert await tm.get_access_token() == "jwt-1"
     tm.invalidate()
     assert await tm.get_access_token() == "jwt-2"
@@ -75,12 +79,18 @@ async def test_auth_error_raises():
         return httpx.Response(
             401,
             json={
-                "error": {"status": 401, "code": "INVALID_API_KEY", "detail": "bad key"},
+                "error": {
+                    "status": 401,
+                    "code": "INVALID_API_KEY",
+                    "detail": "bad key",
+                },
                 "request_id": "r",
             },
         )
 
-    tm = TokenManager(_cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    tm = TokenManager(
+        _cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
     with pytest.raises(CwsAuthError, match="INVALID_API_KEY"):
         await tm.get_access_token()
 
@@ -95,5 +105,7 @@ async def test_ws_ticket():
             return _d8({"ticket": "tick-123", "expires_at": "soon"})
         raise AssertionError(request.url.path)
 
-    tm = TokenManager(_cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    tm = TokenManager(
+        _cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
     assert await tm.get_ws_ticket() == "tick-123"

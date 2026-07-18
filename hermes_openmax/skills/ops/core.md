@@ -31,7 +31,8 @@
 
 返回字段含 `member_id` / `org_id` / `role`;后续操作都依赖这些 ID。
 
-**当前工具未暴露,如需要请告知 owner**:core.self_rename(改自己的 display_name;语义备忘:它走身份级自助端点,对该身份加入的所有 org 生效;普通 agent 是 org-member,没有权限走管理员的成员改名端点)。
+改自己的 display_name:`workspace_members(action=rename, name)`。这是身份级自助操作;
+不要尝试管理员成员改名接口。
 
 ### 成员
 
@@ -40,22 +41,32 @@
 | 列成员 | 列当前 org 全部成员,可按类型过滤、按名字搜索 | `workspace_members(action=list, kind="human"或"agent"?, search?)` |
 | 查成员 | 单个成员详情(含 online_status / 角色等) | `workspace_members(action=get, member_id)` |
 | 建 DM | 与某成员开私聊(幂等,已存在直接返回) | `workspace_members(action=create_dm, peer_member_id)` |
+| 能力画像 | 派 Agent 前按 project/member scope 读取 skills、tags、online | `workspace_members(action=agent_profiles, project_id? 或 member_id?)` |
+| 自助改名 | 修改当前 Agent 显示名 | `workspace_members(action=rename, name)` |
+| 列组织/角色 | 当前身份的组织和角色目录 | `workspace_members(action=orgs)` / `workspace_members(action=roles)` |
+| 前端链接 | 生成带 `/workspace` 前缀的链接 | `workspace_members(action=frontend_url, path="projects?project=...")` |
 
 - `kind` 取值:`human` / `agent`;不传则全部
 - `search` 对名字/邮箱做模糊匹配
 
-**当前工具未暴露,如需要请告知 owner**:
+项目成员走 `workspace_tasks(action=project_members, project_id)`。
 
-- core.project_members(列项目成员,派活前找候选人;可临时用 `list` 全组织列表替代)
-- core.agent_profiles(聚合 agent 能力画像:自报 skills + owner/admin 人工标注 tags + online_status。语义备忘:使用方式是**不要按 skill/tag 名精确匹配**——各 agent 命名不一致,服务端也不做硬过滤;应拉全量画像让 LLM 语义匹配,再结合 online_status 选候选;最终指派仍需发起人确认)
+派 Agent 前**必须**调用
+`workspace_members(action=agent_profiles, project_id)` 获取 skills + tags + online_status。
+不要按标签字符串硬匹配;由 LLM 做语义匹配,给发起人“候选 + 理由”,最终由发起人确认。
 
 ### 项目
 
-项目目录用 `workspace_tasks(action=list_projects)`(见 `ops/tm.md`)。项目的 CRUD/归档/成员管理当前均未暴露。
+项目目录与 CRUD/归档/成员管理均走 `workspace_tasks`,见 `ops/tm.md`。
 
-### 组织 / 角色 / 邀请 / 平台 Agent / Onboarding(均未暴露)
+### 组织 / 角色 / 邀请 / 平台 Agent / Onboarding
 
-以下能力**当前工具均未暴露,如需要请告知 owner**。保留语义备忘以便识别场景:
+当前原生工具已暴露只读组织/角色目录:
+
+- `workspace_members(action=orgs)`
+- `workspace_members(action=roles)`
+
+邀请、组织创建/切换、平台 Agent 生命周期与 onboarding 事件仍未暴露;遇到这些写操作应明确告知 owner,不要手搓 REST。
 
 - **组织**:org_list(我加入的组织)、org_get、org_create(创建者自动成为 owner)、org_switch(切换组织;源系统中切换后会签发新 token、旧 token 仍在旧 org 作用域 —— 我们这里 org 作用域由平台管理,切 org 需平台侧配置)
 - **角色**:role_list(发邀请前拿 role_id;scope 可取 org / project;角色通常 4-8 个,不分页)
@@ -68,10 +79,10 @@
 ```text
 1. 我是谁:workspace_members(action=me)
 2. 列项目确认目标:workspace_tasks(action=list_projects)
-3. 找候选成员:workspace_members(action=list, kind="agent", search="...")
-   (项目级成员列表与能力画像当前未暴露;需要精细选人时告知 owner)
-4. 查候选详情(含 online_status):workspace_members(action=get, member_id="<m>")
-5. 派活(转 workspace_tasks;最终指派仍需发起人确认):
+3. 看项目成员:workspace_tasks(action=project_members, project_id="<p>")
+4. 拉能力画像:workspace_members(action=agent_profiles, project_id="<p>")
+5. 按 skills/tags/online_status 做语义匹配,把候选与理由交发起人确认
+6. 派活(转 workspace_tasks;最终指派仍需发起人确认):
    workspace_tasks(action=create_task, project_id, issue_id, body={title:"...", assignee_id:"<m>"})
 ```
 

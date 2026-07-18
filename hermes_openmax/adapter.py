@@ -11,6 +11,7 @@ Delivery invariant: the SDK only advances its ack watermark after the
 ``handle_message`` — so a message is only acked once the gateway has truly
 accepted it.
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,6 +27,7 @@ from gateway.platforms.base import (
 from cws_agent_sdk import CwsBridge, CwsConfig, InboundMessage
 from cws_agent_sdk.access_policy import AccessPolicyConfig
 from cws_agent_sdk.providers import FileStorage
+from .behavior import build_workspace_orientation, extract_local_markdown_images
 
 
 def _policy_from_env() -> AccessPolicyConfig:
@@ -37,7 +39,9 @@ def _policy_from_env() -> AccessPolicyConfig:
             return default
         return raw in ("1", "true", "yes", "on")
 
-    allow = [s.strip() for s in os.getenv("CWS_ALLOWED_USERS", "").split(",") if s.strip()]
+    allow = [
+        s.strip() for s in os.getenv("CWS_ALLOWED_USERS", "").split(",") if s.strip()
+    ]
     dm_policy = os.getenv("CWS_DM_POLICY", "").strip().lower()
     if dm_policy not in ("open", "allowlist", "owner"):
         # Resolution order mirrors zylos: explicit allow-all -> open;
@@ -56,6 +60,7 @@ def _policy_from_env() -> AccessPolicyConfig:
         allow_sibling_dm=flag("CWS_ALLOW_SIBLING_DM", False),
         dm_allowlist=allow,
     )
+
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +88,7 @@ class CwsAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform("cws"))
         self._bridge: Optional[CwsBridge] = None
         self._orientation: str = ""
+        self._readonly_message_ids: set[str] = set()
         CwsAdapter._last_instance = self
 
     # -- lifecycle -----------------------------------------------------
@@ -126,30 +132,14 @@ class CwsAdapter(BasePlatformAdapter):
             if owner_id:
                 owner = await self._bridge.core.get_member(owner_id)
                 owner_name = str(owner.get("display_name") or "")
-            self._orientation = (
-                "# OpenMax Workspace context\n"
-                f"You are workspace member '{me.get('display_name')}' (agent, member_id "
-                f"{me.get('member_id')}) in org '{me.get('org_name')}' ({me.get('org_slug')}). "
-                f"Your responsible human owner is '{owner_name or 'unknown'}'"
-                f"{f' (member_id {owner_id})' if owner_id else ''}.\n"
-                "You have native workspace tools: workspace_tasks (projects/issues/tasks/"
-                "comments/blueprints/attempts), workspace_kb, workspace_comm (proactive "
-                "messaging), workspace_artifacts, workspace_members. Use them for any "
-                "workspace request instead of guessing; never use built-in todo tools for "
-                "workspace tasks.\n"
-                "IMPORTANT: before handling any TASK-shaped message (a work goal, not simple "
-                "Q&A), load the work discipline via skill_view('hermes-openmax:workspace') "
-                "and follow it (register Issue→Blueprint→Task before working; confirm "
-                "project+KB with the user; owner acceptance closes the loop).\n"
-                "System Member DMs (scheduler) drive the task flow: act on them in the "
-                "referenced Issue/Task context, never reply to them. In group smart-mode, "
-                "reply exactly [SKIP] to stay silent. Reply in the conversation's language."
-            )
             import os
 
-            persona = os.getenv("CWS_PERSONA", "").strip()
-            if persona:
-                self._orientation += f"\n# Workspace persona\n{persona}"
+            self._orientation = build_workspace_orientation(
+                me,
+                owner_name=owner_name,
+                owner_id=owner_id,
+                persona=os.getenv("CWS_PERSONA", ""),
+            )
             logger.info("[cws] orientation built (%d chars)", len(self._orientation))
         except Exception as exc:  # noqa: BLE001 — orientation is an enhancement
             logger.warning("[cws] orientation build failed: %s", exc)
@@ -158,6 +148,13 @@ class CwsAdapter(BasePlatformAdapter):
         if self._bridge:
             await self._bridge.stop()
             self._bridge = None
+
+    @staticmethod
+    def extract_images(content: str):
+        """Extend Hermes image extraction with safe local ``file://`` images."""
+        remote_images, cleaned = BasePlatformAdapter.extract_images(content)
+        local_images, cleaned = extract_local_markdown_images(cleaned)
+        return remote_images + local_images, cleaned
 
     @classmethod
     def last_instance_connected(cls) -> bool:
@@ -175,6 +172,11 @@ class CwsAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._bridge:
             return SendResult(success=False, error="cws bridge not connected")
+        if reply_to and reply_to in getattr(self, "_readonly_message_ids", set()):
+            logger.info(
+                "[cws] reply suppressed for read-only system message %s", reply_to
+            )
+            return SendResult(success=True, message_id="")
         # zylos parity: a bare [SKIP] reply means "intentionally stay silent"
         # (e.g. group smart-mode judged the message not worth answering).
         if content.strip().upper() == "[SKIP]":
@@ -192,7 +194,9 @@ class CwsAdapter(BasePlatformAdapter):
             logger.warning("[cws] send failed conv=%s: %s", chat_id, exc)
             return SendResult(success=False, error=str(exc))
 
-    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+    async def send_typing(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
         if self._bridge:
             try:
                 await self._bridge.send_typing(chat_id)
@@ -211,6 +215,8 @@ class CwsAdapter(BasePlatformAdapter):
         streaming-style progressive replies)."""
         if not self._bridge:
             return SendResult(success=False, error="cws bridge not connected")
+        if message_id in getattr(self, "_readonly_message_ids", set()):
+            return SendResult(success=True, message_id="")
         try:
             await self._bridge.comm.edit_message(message_id, content)
             return SendResult(success=True, message_id=message_id)
@@ -225,13 +231,19 @@ class CwsAdapter(BasePlatformAdapter):
 
     async def _on_config_event(self, event: str, data: Dict[str, Any]) -> None:
         """agent.config.* events the SDK doesn't fully interpret land here."""
-        logger.info("[cws] config event %s: %s", event, {k: data.get(k) for k in list(data)[:6]})
+        logger.info(
+            "[cws] config event %s: %s", event, {k: data.get(k) for k in list(data)[:6]}
+        )
 
     # -- inbound: CWS -> gateway ----------------------------------------
 
     async def _on_inbound(self, msg: InboundMessage) -> None:
         """SDK delivery callback. Raising here prevents the ack watermark
         from advancing, so the message is replayed via /sync later."""
+        if msg.sender_type == "system":
+            if not hasattr(self, "_readonly_message_ids"):
+                self._readonly_message_ids = set()
+            self._readonly_message_ids.add(msg.message_id)
         source = self.build_source(
             chat_id=msg.conversation_id,
             chat_name=msg.metadata.get("conversation_name") or None,
@@ -291,6 +303,8 @@ class CwsAdapter(BasePlatformAdapter):
         not send_image)."""
         if not self._bridge:
             return SendResult(success=False, error="cws bridge not connected")
+        if reply_to and reply_to in getattr(self, "_readonly_message_ids", set()):
+            return SendResult(success=True, message_id="")
         try:
             receipt = await self._bridge.send_image_file(
                 chat_id, image_path, caption=caption or "", reply_to=reply_to
@@ -300,7 +314,9 @@ class CwsAdapter(BasePlatformAdapter):
             logger.warning("[cws] send_image_file failed: %s", exc)
             try:
                 receipt = await self._bridge.send(
-                    chat_id, f"{caption or ''}\n⚠️ 图片发送失败".strip(), reply_to=reply_to
+                    chat_id,
+                    f"{caption or ''}\n⚠️ 图片发送失败".strip(),
+                    reply_to=reply_to,
                 )
                 return SendResult(success=True, message_id=receipt.message_id)
             except Exception as exc2:  # noqa: BLE001
@@ -322,6 +338,8 @@ class CwsAdapter(BasePlatformAdapter):
 
         if not self._bridge:
             return SendResult(success=False, error="cws bridge not connected")
+        if reply_to and reply_to in getattr(self, "_readonly_message_ids", set()):
+            return SendResult(success=True, message_id="")
         try:
             if os.path.isfile(image_url):
                 size = os.path.getsize(image_url)
@@ -334,7 +352,8 @@ class CwsAdapter(BasePlatformAdapter):
                     with open(image_url, "rb") as fh:
                         async with httpx.AsyncClient(timeout=120) as up:
                             resp = await up.put(
-                                prep["upload_url"], content=fh.read(),
+                                prep["upload_url"],
+                                content=fh.read(),
                                 headers=prep.get("headers") or {},
                             )
                             resp.raise_for_status()
@@ -342,8 +361,9 @@ class CwsAdapter(BasePlatformAdapter):
                     prep["upload_token"]
                 )
                 text = caption or f"[image] {fname}"
-                receipt = await self._bridge.send(chat_id, text, reply_to=reply_to,
-                                                  metadata={"attachment": node})
+                receipt = await self._bridge.send(
+                    chat_id, text, reply_to=reply_to, metadata={"attachment": node}
+                )
                 return SendResult(success=True, message_id=receipt.message_id)
             # Remote URL: no re-hosting — send as markdown image link.
             text = f"![{caption or 'image'}]({image_url})"

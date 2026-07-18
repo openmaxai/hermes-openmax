@@ -8,6 +8,7 @@ Contract highlights (cws-comm ws/):
 - Close codes: 4001 heartbeat, 4002 auth, 4003 session expired,
   4004 rate limited, 4005 org suspended, 4006 duplicate device.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -35,9 +36,9 @@ from .errors import CwsWsFatal
 from .providers import Logger, StdLogger
 
 # Closes we never auto-recover from: somebody must fix account/deployment state.
-_FATAL_CLOSES = {CLOSE_ORG_SUSPENDED, CLOSE_DUPLICATE_DEVICE}
+_FATAL_CLOSES = {CLOSE_AUTH_FAILURE, CLOSE_ORG_SUSPENDED, CLOSE_DUPLICATE_DEVICE}
 # Closes that invalidate the auth state before reconnecting.
-_REAUTH_CLOSES = {CLOSE_AUTH_FAILURE, CLOSE_SESSION_EXPIRED}
+_REAUTH_CLOSES = {CLOSE_SESSION_EXPIRED}
 
 
 class CwsWsClient:
@@ -93,6 +94,17 @@ class CwsWsClient:
             raise ConnectionError("cws ws not connected")
         await self._conn.send(text)
 
+    def _apply_close_semantics(self, close) -> None:
+        """Apply zylos close policy, raising when reconnect must stop."""
+        code = close.code or 0
+        reason = close.reason or ""
+        if code in _FATAL_CLOSES:
+            if self._on_fatal:
+                self._on_fatal(code, reason)
+            raise CwsWsFatal(code, reason)
+        if code in _REAUTH_CLOSES and self._on_auth_reset:
+            self._on_auth_reset()
+
     async def _json_keepalive(self, conn) -> None:
         """Client-initiated app-level JSON ping (zylos ws.js parity)."""
         try:
@@ -112,7 +124,9 @@ class CwsWsClient:
                 ticket = await self._ticket_provider()
                 base = self._cfg.ws_url.rstrip("/")
                 if not base.endswith("/ws"):
-                    base = f"{base}/ws"  # accept ws_url given with or without the /ws path
+                    base = (
+                        f"{base}/ws"  # accept ws_url given with or without the /ws path
+                    )
                 url = f"{base}?ticket={ticket}&device_id={self._cfg.device_id}"
                 async with websockets.connect(
                     url,
@@ -154,12 +168,7 @@ class CwsWsClient:
             except ConnectionClosed as exc:
                 code = exc.code or 0
                 self._log.warn(f"closed code={code} reason={exc.reason!r}")
-                if code in _FATAL_CLOSES:
-                    if self._on_fatal:
-                        self._on_fatal(code, exc.reason or "")
-                    raise CwsWsFatal(code, exc.reason or "")
-                if code in _REAUTH_CLOSES and self._on_auth_reset:
-                    self._on_auth_reset()
+                self._apply_close_semantics(exc)
                 if code == CLOSE_RATE_LIMITED:
                     backoff = max(backoff, 10.0)
             except CwsWsFatal:

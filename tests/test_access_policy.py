@@ -32,19 +32,24 @@ def test_dm_owner_policy_and_exemption():
     cfg = AccessPolicyConfig(dm_policy="owner")
     d = decide_inbound(msg(sender_id="u-7"), self_member_id=ME, cfg=cfg)
     assert not d.handle and d.reason == "dm_owner_only"
-    d = decide_inbound(msg(sender_id="boss-1"), self_member_id=ME, cfg=cfg,
-                       owner_member_id="boss-1")
+    d = decide_inbound(
+        msg(sender_id="boss-1"), self_member_id=ME, cfg=cfg, owner_member_id="boss-1"
+    )
     assert d.handle and d.reason == "dm_owner"
     # owner also bypasses allowlist
     cfg2 = AccessPolicyConfig(dm_policy="allowlist", dm_allowlist=[])
-    assert decide_inbound(msg(sender_id="boss-1"), self_member_id=ME, cfg=cfg2,
-                          owner_member_id="boss-1").handle
+    assert decide_inbound(
+        msg(sender_id="boss-1"), self_member_id=ME, cfg=cfg2, owner_member_id="boss-1"
+    ).handle
 
 
 def test_group_owner_mention_bypass():
     cfg = AccessPolicyConfig(group_require_mention=True)
-    m = msg(sender_id="boss-1", conv_type="group",
-            mentions=[{"type": "member", "member_id": ME}])
+    m = msg(
+        sender_id="boss-1",
+        conv_type="group",
+        mentions=[{"type": "member", "member_id": ME}],
+    )
     d = decide_inbound(m, self_member_id=ME, cfg=cfg, owner_member_id="boss-1")
     assert d.handle and d.reason == "group_owner_mention"
 
@@ -81,7 +86,11 @@ def test_agent_dm_blocked_by_default():
 
 
 def test_agent_group_blocked_even_with_mention_unless_allowed():
-    m = msg(sender_type="agent", conv_type="group", mentions=[{"type": "member", "member_id": ME}])
+    m = msg(
+        sender_type="agent",
+        conv_type="group",
+        mentions=[{"type": "member", "member_id": ME}],
+    )
     assert not decide_inbound(m, self_member_id=ME).handle
     cfg = AccessPolicyConfig(allow_agent_senders=True)
     assert decide_inbound(m, self_member_id=ME, cfg=cfg).handle
@@ -91,7 +100,9 @@ def test_system_sender_delivered_by_default():
     # Scheduler DMs drive the task flow (dependency-ready, issue.activated).
     assert decide_inbound(msg(sender_type="system"), self_member_id=ME).handle
     cfg = AccessPolicyConfig(handle_system=False)
-    assert not decide_inbound(msg(sender_type="system"), self_member_id=ME, cfg=cfg).handle
+    assert not decide_inbound(
+        msg(sender_type="system"), self_member_id=ME, cfg=cfg
+    ).handle
 
 
 def test_own_message_never_handled():

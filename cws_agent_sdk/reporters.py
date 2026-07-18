@@ -3,10 +3,11 @@
 All three follow the same discipline as zylos-openmax: reporter failures must
 never break the message path — they log and move on.
 """
+
 from __future__ import annotations
 
 import time
-from typing import Any, Awaitable, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 from .errors import CwsApiError, CwsAuthError
 from .http import CwsHttpClient
@@ -35,7 +36,10 @@ class OnlineReporter:
         try:
             data = await self._http.post(f"/api/v1/agents/{member_id}/online-report")
             self._log.log(
-                "online-report ok:", data.get("reason", "?"), "triggered=", data.get("triggered")
+                "online-report ok:",
+                data.get("reason", "?"),
+                "triggered=",
+                data.get("triggered"),
             )
             return data
         except (CwsApiError, CwsAuthError) as exc:

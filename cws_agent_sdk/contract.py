@@ -7,6 +7,7 @@ real code paths (text extraction, access-policy decisions) and the output
 compared/validated in the contract's vocabulary. It is not used on the hot
 message path.
 """
+
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -30,7 +31,9 @@ _REASON_MAP = {
 }
 
 
-def _policy_from_org(org: dict, conversation: Optional[dict]) -> tuple[AccessPolicyConfig, str]:
+def _policy_from_org(
+    org: dict, conversation: Optional[dict]
+) -> tuple[AccessPolicyConfig, str]:
     """Translate a fixture's org.access block into our policy + group mode."""
     access = (org or {}).get("access") or {}
     dm_policy = str(access.get("dmPolicy", "open")).lower()

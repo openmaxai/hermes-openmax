@@ -5,15 +5,16 @@ through this SDK's REAL code paths.
 Passing this corpus is, per upstream CONTRACT.md, the definition of
 "protocol-conformant" for any SDK in any language.
 """
+
 import json
 from pathlib import Path
+
+from cws_agent_sdk.codec import classify_frame, classify_system_event
+from cws_agent_sdk.contract import normalize_for_contract
 
 import pytest
 
 jsonschema = pytest.importorskip("jsonschema")
-
-from cws_agent_sdk.codec import classify_frame, classify_system_event
-from cws_agent_sdk.contract import normalize_for_contract
 
 ROOT = Path(__file__).parent.parent / "contract"
 FIXTURES = ROOT / "fixtures" / "v1"
@@ -48,6 +49,7 @@ def _validate(instance, schema):
 
 # -- frame classification ------------------------------------------------------
 
+
 @pytest.mark.parametrize("path", _load("frame-classification"), ids=lambda p: p.stem)
 def test_frame_classification(path):
     fx = json.loads(path.read_text())
@@ -56,7 +58,10 @@ def test_frame_classification(path):
 
 # -- system event classification ------------------------------------------------
 
-@pytest.mark.parametrize("path", _load("system-event-classification"), ids=lambda p: p.stem)
+
+@pytest.mark.parametrize(
+    "path", _load("system-event-classification"), ids=lambda p: p.stem
+)
 def test_system_event_classification(path):
     fx = json.loads(path.read_text())
     raw = fx["input"]
@@ -65,6 +70,7 @@ def test_system_event_classification(path):
 
 
 # -- normalized inbound message --------------------------------------------------
+
 
 def _assert_subset(expected: dict, actual: dict, ctx: str):
     for key, want in expected.items():
@@ -99,6 +105,7 @@ def test_inbound_message_normalization(path):
 
 
 # -- wake request / result (schema conformance) -----------------------------------
+
 
 @pytest.mark.parametrize("path", _load("wake-request"), ids=lambda p: p.stem)
 def test_wake_request_schema(path):

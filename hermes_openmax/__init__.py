@@ -1,4 +1,5 @@
 """hermes-openmax — CWS/OpenMax Workspace platform plugin for Hermes Agent."""
+
 from __future__ import annotations
 
 import os
@@ -59,8 +60,15 @@ def _env_enablement():
     return seed
 
 
-async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id=None,
-                           media_files=None, force_document=False) -> dict:
+async def _standalone_send(
+    pconfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+) -> dict:
     """Out-of-process delivery for deliver=cws cron jobs (gateway not running).
 
     CWS needs no live socket to send — a short-lived REST client suffices."""
@@ -92,20 +100,33 @@ def register(ctx):
 
     skills_dir = Path(__file__).parent / "skills"
     _skills = [
-        ("workspace", skills_dir / "workspace.md",
-         "OpenMax workspace 工作纪律(Guided Autonomy):任务流/状态机/护栏/礼仪"),
-        ("tm-ops", skills_dir / "ops" / "tm.md",
-         "TM 操作手册:Project/Issue/Task/Attempt/Blueprint/评论/定时绑定"),
-        ("kb-ops", skills_dir / "ops" / "kb.md",
-         "KB 操作手册:页面/目录树/版本/回收站/搜索"),
-        ("as-ops", skills_dir / "ops" / "as.md",
-         "文件/附件操作手册:上传/下载/MEDIA 纪律"),
-        ("comm-ops", skills_dir / "ops" / "comm.md",
-         "会话操作手册:主动 DM/建群/历史"),
-        ("core-ops", skills_dir / "ops" / "core.md",
-         "目录/身份操作手册:成员/能力画像/改名"),
-        ("conn-ops", skills_dir / "ops" / "conn.md",
-         "第三方连接能力说明(暂无工具)"),
+        (
+            "workspace",
+            skills_dir / "workspace.md",
+            "OpenMax workspace 工作纪律(Guided Autonomy):任务流/状态机/护栏/礼仪",
+        ),
+        (
+            "tm-ops",
+            skills_dir / "ops" / "tm.md",
+            "TM 操作手册:Project/Issue/Task/Attempt/Blueprint/评论/定时绑定",
+        ),
+        (
+            "kb-ops",
+            skills_dir / "ops" / "kb.md",
+            "KB 操作手册:页面/目录树/版本/回收站/搜索",
+        ),
+        (
+            "as-ops",
+            skills_dir / "ops" / "as.md",
+            "文件/附件操作手册:上传/下载/MEDIA 纪律",
+        ),
+        ("comm-ops", skills_dir / "ops" / "comm.md", "会话操作手册:主动 DM/建群/历史"),
+        (
+            "core-ops",
+            skills_dir / "ops" / "core.md",
+            "目录/身份操作手册:成员/能力画像/改名",
+        ),
+        ("conn-ops", skills_dir / "ops" / "conn.md", "第三方连接能力说明(暂无工具)"),
     ]
     for skill_name, skill_path, desc in _skills:
         if skill_path.exists():
@@ -142,7 +163,9 @@ def register(ctx):
         pii_safe=True,
         max_message_length=3000,  # matches zylos splitMessage maxLen / FE expectations
         platform_hint=(
-            "You are chatting inside an OpenMax workspace. Markdown is "
+            "You are chatting inside an OpenMax workspace. For every user "
+            "message, first load hermes-openmax:workspace, then classify it "
+            "as task versus Q&A/chat and follow that skill. Markdown is "
             "supported. Conversations may be DMs or group channels with "
             "humans and other agents; mention people with @name. Keep "
             "workspace etiquette: answer in the conversation's language. "

@@ -5,6 +5,7 @@ The SDK only speaks the CWS HTTP/WS contract. Anything that touches the host
 Every provider has a default implementation so a missing provider degrades a
 feature instead of crashing the message path.
 """
+
 from __future__ import annotations
 
 import json

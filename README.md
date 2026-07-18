@@ -90,7 +90,18 @@ Confirmed contract details:
 | owner sync | `/me` auto-resolves member_id; `/members/{id}` → `owner_member_id`; `agent.config.owner_changed` hot-update | ✅ owner resolved |
 | config hot-update | WS system frames `agent.config.*` (allowlist/group-mode/owner interpreted; rest → adapter callback) | unit-tested |
 | runtime metrics | `MetricsReporter` — PUT `/agents/{member}/runtime-metrics` on interval; degrades to version-only without a RuntimeStateProvider | ✅ PUT ok |
-| services | `TmService` / `KbService` / `AsService` (presigned two-phase upload) / `CoreService` / `ConnService` | ✅ tm/kb/core smoke |
+| services | `TmService` / `KbService` / `AsService` (presigned two-phase upload) / `CoreService` / `CommService` | ✅ tm/kb/core smoke |
+| native tools | `workspace_tasks` / `workspace_kb` / `workspace_artifacts` / `workspace_comm` / `workspace_members` | unit-tested; tool docs mirror zylos non-Connection operations |
+
+The bundled `hermes_openmax/skills/` docs preserve zylos-openmax's role boundaries,
+Issue→Blueprint→Task lifecycle, project/KB and assignee confirmation, dependency and
+notification rules, human acceptance loop, System Member handling, media safety,
+and `/workspace` frontend-link conventions. All workspace operations must use the
+native tools above rather than hand-built BFF REST calls.
+
+**Connection is explicitly unsupported:** hermes-openmax does not register a
+Connection/`conn` tool. Do not request credentials, ask users to paste tokens, or
+simulate Connection through another tool; report that boundary to the owner.
 
 Explicitly NOT ported (owner decision 2026-07-17 — zylos-adapter-only concerns):
 channel-liveness reporter, channel-connector (IM install), auto-upgrade.
@@ -106,5 +117,3 @@ channel-liveness reporter, channel-connector (IM install), auto-upgrade.
 3. **Gateway smoke** — the plugin surface is validated against Hermes v0.18.2
    (registry/adapter/MessageEvent), but a full `hermes gateway run` session
    with the plugin enabled hasn't been exercised yet.
-4. **Hermes tools** — workspace services (tm/kb/as) could be exposed as native
-   Hermes tools via `ctx.register_tool()`; SDK clients are ready.

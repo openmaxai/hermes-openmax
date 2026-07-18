@@ -5,6 +5,7 @@ agent worker threads, so each call uses a short-lived SDK client driven by
 asyncio.run(). Tokens are shared with the platform adapter via the same
 FileStorage state dir, so calls reuse the cached JWT instead of re-exchanging.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,12 @@ def _run(coro_factory) -> str:
         from cws_agent_sdk import CwsConfig
         from cws_agent_sdk.http import CwsHttpClient
         from cws_agent_sdk.providers import FileStorage
-        from cws_agent_sdk.services import CommService, CoreService, KbService, TmService
+        from cws_agent_sdk.services import (
+            CommService,
+            CoreService,
+            KbService,
+            TmService,
+        )
         from cws_agent_sdk.token import TokenManager
 
         cfg = CwsConfig.from_env()
@@ -42,7 +48,18 @@ def _run(coro_factory) -> str:
         result = asyncio.run(go())
         return json.dumps(result, ensure_ascii=False, default=str)[:20000]
     except Exception as exc:  # noqa: BLE001 — tool errors go back to the model as text
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        payload: dict[str, Any] = {"error": str(exc)}
+        status, body = getattr(exc, "status", None), getattr(exc, "body", None)
+        if status is not None:
+            payload["status"] = status
+        if body is not None:
+            payload["body"] = body
+            errors = (
+                body.get("error", {}).get("errors") if isinstance(body, dict) else None
+            )
+            if errors:
+                payload["errors"] = errors
+        return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 # -- workspace_tasks ---------------------------------------------------------
@@ -51,8 +68,8 @@ TASKS_SCHEMA = {
     "name": "workspace_tasks",
     "description": (
         "Operate OpenMax workspace projects/issues/tasks (cws-work). Actions: "
-        "list_projects, project_create(body{name,lead_member_id,description?}), "
-        "project_get/project_update(body)/project_archive/project_restore(project_id), "
+        "list_projects, project_create(body{name,slug?,lead_member_id,description?,knowledge_base_id?,member_ids?}), "
+        "project_get/project_update(body)/project_archive(project_id), "
         "project_members(project_id), project_member_add/remove(project_id, member_id), "
         "task_get(task_id), blueprint_set_steps(blueprint_id, body{steps}), "
         "binding_get(binding_id), list_issues(project_id?), get_issue(issue_id), "
@@ -66,7 +83,7 @@ TASKS_SCHEMA = {
         "attempt_create(task_id), attempt_list(task_id), "
         "attempt_finish(attempt_id, status=done|failed|blocked|cancelled, reason?), "
         "blueprint_create(issue_id, body{steps[{temp_id,description,depends_on_temp_ids?}],notes?}), "
-        "blueprint_get(blueprint_id), blueprint_list(issue_id), blueprint_submit(blueprint_id), "
+        "blueprint_get(blueprint_id), blueprint_list(issue_id), "
         "work_refs(query? | project_id?) -> proj://... issue://... references, "
         "binding_create(body{cron_expr,lead_member_id,owner_member_id,spec{project_id,title}}), "
         "binding_list, binding_delete(binding_id)"
@@ -87,8 +104,22 @@ TASKS_SCHEMA = {
             "status": {"type": "string"},
             "reason": {"type": "string"},
             "query": {"type": "string"},
-            "name": {"type": "string", "description": "sub-action name for issue_action/task_action"},
+            "name": {
+                "type": "string",
+                "description": "sub-action name for issue_action/task_action",
+            },
             "member_id": {"type": "string"},
+            "role": {"type": "string"},
+            "page": {"type": "integer"},
+            "page_size": {"type": "integer"},
+            "order_by": {"type": "string"},
+            "statuses": {"type": "array", "items": {"type": "string"}},
+            "priority": {"type": "string"},
+            "include_archived": {"type": "boolean"},
+            "blocked_on_approval_request_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
             "body": {"type": "object"},
             "limit": {"type": "integer"},
         },
@@ -104,36 +135,52 @@ def handle_tasks(args: dict, **kw: Any) -> str:
         limit = int(args.get("limit") or 20)
         body = args.get("body") or {}
         if a == "list_projects":
-            return await tm.list_projects(limit=limit)
-        if a == "project_create":
-            return await tm.create_project(
-                body.get("name") or args.get("name", ""),
-                body.get("lead_member_id", ""),
-                description=body.get("description", ""),
+            return await tm.list_projects(
+                limit=limit,
+                status=args.get("status"),
+                query=args.get("query"),
+                page=args.get("page"),
+                page_size=args.get("page_size"),
+                order_by=args.get("order_by"),
             )
+        if a == "project_create":
+            return await tm.create_project(body)
         if a == "project_get":
             return await tm.get_project(args["project_id"])
         if a == "project_update":
             return await tm.update_project(args["project_id"], body)
         if a == "project_archive":
             return await tm.archive_project(args["project_id"])
-        if a == "project_restore":
-            return await tm.restore_project(args["project_id"])
         if a == "project_members":
             return await tm.list_project_members(args["project_id"])
         if a == "project_member_add":
-            return await tm.add_project_member(args["project_id"], args["member_id"])
+            return await tm.add_project_member(
+                args["project_id"], args["member_id"], role=args.get("role", "member")
+            )
         if a == "project_member_remove":
             await tm.remove_project_member(args["project_id"], args["member_id"])
             return {"ok": True}
         if a == "task_get":
             return await tm.get_task(args["task_id"])
         if a == "blueprint_set_steps":
-            return await tm.set_blueprint_steps(args["blueprint_id"], body.get("steps") or [])
+            return await tm.set_blueprint_steps(
+                args["blueprint_id"], body.get("steps") or []
+            )
         if a == "binding_get":
             return await tm.get_event_binding(args["binding_id"])
         if a == "list_issues":
-            return await tm.list_issues(args.get("project_id"), limit=limit)
+            return await tm.list_issues(
+                args.get("project_id"),
+                limit=limit,
+                status=args.get("status"),
+                statuses=args.get("statuses"),
+                priority=args.get("priority"),
+                include_archived=args.get("include_archived"),
+                query=args.get("query"),
+                page=args.get("page"),
+                page_size=args.get("page_size"),
+                order_by=args.get("order_by"),
+            )
         if a == "get_issue":
             return await tm.get_issue(args["issue_id"])
         if a == "create_issue":
@@ -143,40 +190,68 @@ def handle_tasks(args: dict, **kw: Any) -> str:
         if a == "issue_action":
             return await tm.issue_action(args["issue_id"], args["name"], body)
         if a == "list_tasks":
-            return await tm.list_tasks(args.get("issue_id"), limit=limit)
+            return await tm.list_tasks(
+                args.get("issue_id"),
+                limit=limit,
+                project_id=args.get("project_id"),
+                status=args.get("status"),
+                include_archived=args.get("include_archived"),
+                page=args.get("page"),
+                page_size=args.get("page_size"),
+                order_by=args.get("order_by"),
+            )
         if a == "create_task":
             return await tm.create_task(args["project_id"], args["issue_id"], body)
         if a == "task_action":
             return await tm.task_action(args["task_id"], args["name"], body)
         if a == "comment_create":
-            return await tm.create_comment(args["work_type"], args["work_id"], args["text"])
+            return await tm.create_comment(
+                args["work_type"], args["work_id"], args["text"]
+            )
         if a == "comment_list":
-            return await tm.list_comments(args["work_type"], args["work_id"], limit=limit)
+            return await tm.list_comments(
+                args["work_type"], args["work_id"], limit=limit
+            )
+        if a == "comment_get":
+            return await tm.get_comment(args["work_id"])
         if a == "attempt_create":
             return await tm.create_attempt(args["task_id"])
         if a == "attempt_list":
             return await tm.list_attempts(args["task_id"])
+        if a == "attempt_get":
+            return await tm.get_attempt(args["attempt_id"])
         if a == "attempt_finish":
             return await tm.transition_attempt(
-                args["attempt_id"], args["status"], failure_reason=args.get("reason", "")
+                args["attempt_id"],
+                args["status"],
+                failure_reason=args.get("reason", ""),
+                blocked_on_approval_request_ids=args.get(
+                    "blocked_on_approval_request_ids"
+                ),
             )
         if a == "blueprint_create":
             return await tm.create_blueprint(
-                args["issue_id"], body.get("steps") or [], notes=body.get("notes", "")
+                args["issue_id"],
+                body.get("steps") or [],
+                estimated_budget=body.get("estimated_budget"),
+                notes=body.get("notes", ""),
             )
         if a == "blueprint_get":
             return await tm.get_blueprint(args["blueprint_id"])
         if a == "blueprint_list":
             return await tm.list_blueprints(args["issue_id"])
-        if a == "blueprint_submit":
-            return await tm.submit_blueprint(args["blueprint_id"])
+
         if a == "work_refs":
             return await tm.work_references(
-                query=args.get("query", ""), project_id=args.get("project_id", ""), limit=limit
+                query=args.get("query", ""),
+                project_id=args.get("project_id", ""),
+                limit=limit,
             )
         if a == "binding_create":
             return await tm.create_event_binding(
-                body["cron_expr"], body["lead_member_id"], body.get("spec") or {},
+                body["cron_expr"],
+                body["lead_member_id"],
+                body.get("spec") or {},
                 owner_member_id=body.get("owner_member_id", ""),
             )
         if a == "binding_list":
@@ -223,6 +298,10 @@ KB_SCHEMA = {
             "query": {"type": "string"},
             "body": {"type": "object"},
             "limit": {"type": "integer"},
+            "offset": {"type": "integer"},
+            "cursor": {"type": "string"},
+            "sort": {"type": "string"},
+            "inline": {"type": "boolean"},
         },
         "required": ["action"],
     },
@@ -236,8 +315,27 @@ def handle_kb(args: dict, **kw: Any) -> str:
         limit = int(args.get("limit") or 20)
         if a == "list_kbs":
             return await kb.list_kbs(limit=limit)
+        if a == "kb_init":
+            return await kb.init_kb()
+        if a == "kb_get":
+            return await kb.get_kb(args["kb_id"])
+        if a == "kb_update":
+            return await kb.update_kb(args["kb_id"], args.get("body") or {})
+        if a == "kb_delete":
+            await kb.delete_kb(args["kb_id"])
+            return {"ok": True}
+        if a == "kb_archive":
+            return await kb.archive_kb(args["kb_id"])
+        if a == "kb_unarchive":
+            return await kb.unarchive_kb(args["kb_id"])
         if a == "search":
-            return await kb.search_pages(args["query"], kb_id=args.get("kb_id"), limit=limit)
+            return await kb.search_pages(
+                args["query"],
+                kb_id=args.get("kb_id"),
+                limit=limit,
+                offset=args.get("offset"),
+                sort=args.get("sort"),
+            )
         if a == "get_page":
             return await kb.get_page(args["page_id"])
         if a == "get_page_content":
@@ -248,10 +346,28 @@ def handle_kb(args: dict, **kw: Any) -> str:
             return await kb.create_page(args["kb_id"], args.get("body") or {})
         if a == "tree":
             return await kb.get_tree(args["kb_id"])
+        if a == "node_get":
+            return await kb.get_node(args["kb_id"], args["node_id"])
+        if a == "breadcrumb":
+            return await kb.get_breadcrumb(args["kb_id"], args["node_id"])
+        if a == "children":
+            return await kb.list_children(
+                args["kb_id"], args.get("parent_id") or args["node_id"]
+            )
+        if a == "preview":
+            return await kb.preview_node(args["kb_id"], args["node_id"])
+        if a == "pages":
+            return await kb.list_pages(
+                cursor=args.get("cursor"), limit=limit, offset=args.get("offset")
+            )
         if a == "revisions":
             return await kb.list_revisions(args["page_id"], limit=limit)
+        if a == "page_revision":
+            return await kb.get_revision(args["page_id"], int(args["revision_id"]))
         if a == "revision_diff":
-            return await kb.diff_revisions(args["page_id"], int(args["from_rev"]), int(args["to_rev"]))
+            return await kb.diff_revisions(
+                args["page_id"], int(args["from_rev"]), int(args["to_rev"])
+            )
         if a == "revision_restore":
             return await kb.restore_revision(args["page_id"], int(args["revision_id"]))
         if a == "trash":
@@ -261,20 +377,28 @@ def handle_kb(args: dict, **kw: Any) -> str:
         if a == "trashed":
             return await kb.list_trashed(limit=limit)
         if a == "create_folder":
-            return await kb.create_folder(args["kb_id"], args["name"], args.get("parent_id", ""))
+            return await kb.create_folder(
+                args["kb_id"], args["name"], args.get("parent_id", "")
+            )
         if a == "rename_node":
             await kb.rename_node(args["kb_id"], args["node_id"], args["name"])
             return {"ok": True}
         if a == "move_node":
-            await kb.move_node(args["kb_id"], args["node_id"], args.get("parent_id", ""))
+            await kb.move_node(
+                args["kb_id"], args["node_id"], args.get("parent_id", "")
+            )
             return {"ok": True}
         if a == "delete_node":
             await kb.delete_node(args["kb_id"], args["node_id"])
             return {"ok": True}
         if a == "download_node":
-            return await kb.download_node(args["kb_id"], args["node_id"])
+            return await kb.download_node(
+                args["kb_id"], args["node_id"], inline=bool(args.get("inline"))
+            )
         if a == "kb_create":
-            return await kb.create_kb(args.get("body") or {"name": args.get("name", "")})
+            return await kb.create_kb(
+                args.get("body") or {"name": args.get("name", "")}
+            )
         if a == "page_update":
             return await kb.update_page(args["page_id"], args.get("body") or {})
         if a == "page_delete":
@@ -286,10 +410,17 @@ def handle_kb(args: dict, **kw: Any) -> str:
             return await kb.list_page_references(args["page_id"])
         if a == "create_file":
             return await kb.create_file_node(
-                args["kb_id"], args["name"], args["artifact_id"], args.get("parent_id", "")
+                args["kb_id"],
+                args["name"],
+                args["artifact_id"],
+                args.get("parent_id", ""),
             )
         if a == "batch_download":
-            return await kb.batch_download(args["kb_id"], list(args.get("node_ids") or []))
+            return await kb.batch_download(
+                args["kb_id"],
+                list(args.get("node_ids") or []),
+                inline=bool(args.get("inline")),
+            )
         return {"error": f"unknown action {a!r}"}
 
     return _run(go)
@@ -311,6 +442,18 @@ MEMBERS_SCHEMA = {
         "properties": {
             "action": {"type": "string"},
             "member_id": {"type": "string"},
+            "member_ids": {"type": "array", "items": {"type": "string"}},
+            "include": {"type": "array", "items": {"type": "string"}},
+            "capabilities": {"type": "boolean"},
+            "org_id": {"type": "string"},
+            "invitation_id": {"type": "string"},
+            "identity_id": {"type": "string"},
+            "token": {"type": "string"},
+            "status": {"type": "string"},
+            "page": {"type": "integer"},
+            "page_size": {"type": "integer"},
+            "order_by": {"type": "string"},
+            "body": {"type": "object"},
             "peer_member_id": {"type": "string"},
             "kind": {"type": "string"},
             "search": {"type": "string"},
@@ -330,7 +473,9 @@ def handle_members(args: dict, **kw: Any) -> str:
         if a == "me":
             return await core.me()
         if a == "list":
-            return await core.list_members(kind=args.get("kind"), search=args.get("search"))
+            return await core.list_members(
+                kind=args.get("kind"), search=args.get("search")
+            )
         if a == "get":
             return await core.get_member(args["member_id"])
         if a == "create_dm":
@@ -339,6 +484,37 @@ def handle_members(args: dict, **kw: Any) -> str:
             return await core.list_organizations()
         if a == "roles":
             return await core.list_roles()
+        if a == "org_get":
+            return await core.get_organization(args["org_id"])
+        if a == "org_create":
+            return await core.create_organization(args.get("body") or {})
+        if a == "org_switch":
+            return await core.switch_organization(args["org_id"])
+        if a == "invitation_create":
+            return await core.create_invitation(args.get("body") or {})
+        if a == "invitation_list":
+            return await core.list_invitations(
+                status=args.get("status"),
+                page=args.get("page"),
+                page_size=args.get("page_size"),
+                order_by=args.get("order_by"),
+            )
+        if a == "invitation_accept":
+            return await core.accept_invitation(args["invitation_id"], args["token"])
+        if a == "invitation_revoke":
+            await core.revoke_invitation(args["invitation_id"])
+            return {"ok": True}
+        if a == "onboarding_session":
+            return await core.get_onboarding_session()
+        if a == "onboarding_event":
+            return await core.report_onboarding_event(args.get("body") or {})
+        if a == "platform_agent_create":
+            return await core.create_platform_agent(args.get("body") or {})
+        if a == "platform_agent_delete":
+            await core.delete_platform_agent(args["member_id"])
+            return {"ok": True}
+        if a == "agent_domain":
+            return await core.get_agent_domain(args["identity_id"])
         if a == "frontend_url":
             import os
 
@@ -346,16 +522,12 @@ def handle_members(args: dict, **kw: Any) -> str:
             path = args.get("path", "").lstrip("/")
             return {"url": f"{base}/workspace/{path}"}
         if a == "agent_profiles":
-            project_id = args.get("project_id", "")
-            if not project_id and not args.get("member_id"):
-                # Server requires a scope — fall back to the org default project.
-                projects = await svc["tm"].list_projects(limit=50)
-                default = next(
-                    (p for p in projects if p.get("is_default")), projects[0] if projects else None
-                )
-                project_id = str((default or {}).get("id", ""))
             return await core.list_agent_profiles(
-                project_id=project_id, member_id=args.get("member_id", "")
+                project_id=args.get("project_id", ""),
+                member_id=args.get("member_id", ""),
+                member_ids=args.get("member_ids"),
+                include=args.get("include"),
+                capabilities=bool(args.get("capabilities")),
             )
         if a == "rename":
             return await core.set_display_name(args["name"])
@@ -382,6 +554,12 @@ COMM_SCHEMA = {
             "conversation_id": {"type": "string"},
             "text": {"type": "string"},
             "reply_to": {"type": "string"},
+            "message_id": {"type": "string"},
+            "seq": {"type": "integer"},
+            "cursor": {"type": "string"},
+            "after_seq": {"type": "integer"},
+            "before_seq": {"type": "integer"},
+            "include_archived": {"type": "boolean"},
             "name": {"type": "string"},
             "member_ids": {"type": "array", "items": {"type": "string"}},
             "description": {"type": "string"},
@@ -398,9 +576,30 @@ def handle_comm(args: dict, **kw: Any) -> str:
         a = args.get("action")
         limit = int(args.get("limit") or 20)
         if a == "list":
-            return await comm.list_conversations(limit=limit)
+            return await comm.list_conversations(
+                limit=limit,
+                cursor=args.get("cursor"),
+                include_archived=bool(args.get("include_archived")),
+            )
         if a == "history":
-            return await comm.list_messages(args["conversation_id"], limit=limit)
+            return await comm.list_messages(
+                args["conversation_id"],
+                limit=limit,
+                after_seq=args.get("after_seq"),
+                before_seq=args.get("before_seq"),
+            )
+        if a == "get_conversation":
+            return await comm.get_conversation(args["conversation_id"])
+        if a == "get_message":
+            return await comm.get_message(args["conversation_id"], args["message_id"])
+        if a == "unread":
+            return await comm.get_unread(args["conversation_id"])
+        if a == "mark_read":
+            return {
+                "read_until_seq": await comm.mark_read(
+                    args["conversation_id"], args["seq"]
+                )
+            }
         if a == "send":
             r = await comm.send_message(
                 args["conversation_id"], args["text"], reply_to=args.get("reply_to")
@@ -408,7 +607,8 @@ def handle_comm(args: dict, **kw: Any) -> str:
             return {"sent": True, "message_id": r.message_id}
         if a == "create_group":
             return await comm.create_group(
-                args["name"], list(args.get("member_ids") or []),
+                args["name"],
+                list(args.get("member_ids") or []),
                 description=args.get("description", ""),
             )
         return {"error": f"unknown action {a!r}"}
@@ -434,6 +634,10 @@ ARTIFACTS_SCHEMA = {
         "properties": {
             "action": {"type": "string"},
             "uris": {"type": "array", "items": {"type": "string"}},
+            "artifact_id": {"type": "string"},
+            "uri": {"type": "string"},
+            "inline": {"type": "boolean"},
+            "filename": {"type": "string"},
             "conversation_id": {"type": "string"},
             "parent_id": {"type": "string"},
             "local_path": {"type": "string"},
@@ -454,7 +658,21 @@ def handle_artifacts(args: dict, **kw: Any) -> str:
         artifacts = AsService(svc["tm"]._http)  # share the http client
         a = args.get("action")
         if a == "resolve":
-            return await artifacts.resolve_uris(list(args.get("uris") or []))
+            return await artifacts.resolve_uris(
+                list(args.get("uris") or []), inline=bool(args.get("inline"))
+            )
+        if a == "url":
+            return await artifacts.get_url(
+                args.get("uri") or args["artifact_id"], inline=bool(args.get("inline"))
+            )
+        if a == "download":
+            meta = await artifacts.get_url(args.get("uri") or args["artifact_id"])
+            filename = args.get("filename") or meta.get("name") or "artifact"
+            return {
+                "local_path": await artifacts.download(
+                    meta["url"], filename, storage=kw.get("storage")
+                )
+            }
         if a in ("upload", "kb_upload"):
             path = args.get("local_path") or ""
             if not os.path.isfile(path):
@@ -470,18 +688,21 @@ def handle_artifacts(args: dict, **kw: Any) -> str:
                 )
             else:
                 prep = await artifacts.prepare_kb_upload(
-                    args["parent_id"], fname, ctype, size
+                    fname, ctype, size, parent_id=args.get("parent_id", "")
                 )
             if not prep.get("instant_upload"):
                 with open(path, "rb") as fh:
                     async with httpx.AsyncClient(timeout=300) as up:
                         resp = await up.put(
-                            prep["upload_url"], content=fh.read(),
+                            prep["upload_url"],
+                            content=fh.read(),
                             headers=prep.get("headers") or {},
                         )
                         resp.raise_for_status()
             if a == "upload":
-                return await artifacts.finalize_conversation_upload(prep["upload_token"])
+                return await artifacts.finalize_conversation_upload(
+                    prep["upload_token"]
+                )
             return await artifacts.finalize_kb_upload(prep["upload_token"])
         return {"error": f"unknown action {a!r}"}
 

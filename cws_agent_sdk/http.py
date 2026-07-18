@@ -4,6 +4,7 @@
 - On 401: invalidates the token, re-acquires, retries the request once.
 - Unwraps the D8 envelope ({data, request_id, server_time} / problem+json error).
 """
+
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -54,7 +55,10 @@ class CwsHttpClient:
                 continue
             if not unwrap:
                 if resp.status_code // 100 != 2:
-                    raise CwsApiError(f"{resp.status_code}: {resp.text[:200]}", status=resp.status_code)
+                    raise CwsApiError(
+                        f"{resp.status_code}: {resp.text[:200]}",
+                        status=resp.status_code,
+                    )
                 return resp
             return _unwrap_d8(resp)
         raise CwsAuthError("unreachable", status=401)  # pragma: no cover
@@ -65,7 +69,9 @@ class CwsHttpClient:
     async def post(self, path: str, json: Any = None) -> Any:
         return await self.request("POST", path, json=json)
 
-    async def get_page(self, path: str, params: Optional[dict] = None) -> tuple[list, dict]:
+    async def get_page(
+        self, path: str, params: Optional[dict] = None
+    ) -> tuple[list, dict]:
         """GET a CursorListResponse: returns (items, pagination)."""
         url = f"{self._cfg.bff_url}{path}"
         for attempt in (1, 2):

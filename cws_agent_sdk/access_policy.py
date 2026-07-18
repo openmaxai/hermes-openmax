@@ -11,6 +11,7 @@ Port of zylos-openmax's shouldHandleMessage semantics, as a pure function:
   (delivered separately if the adapter wants lifecycle events).
 - Own messages: never handled (also enforced upstream in the bridge).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -27,10 +28,15 @@ class AccessPolicyConfig:
     group_require_mention: bool = True
     allow_agent_senders: bool = False  # let other agents' messages trigger us
     allow_sibling_dm: bool = False  # same-owner agent DMs
-    dm_allowlist: list[str] = field(default_factory=list)  # member_ids (dm_policy=allowlist)
+    dm_allowlist: list[str] = field(
+        default_factory=list
+    )  # member_ids (dm_policy=allowlist)
     # System Member DMs (scheduler "dependencies ready", issue.activated, ...)
     # DRIVE the task flow — zylos lets them straight through. Default True.
     handle_system: bool = True
+    group_policy: str = "open"  # open | allowlist | disabled
+    group_configs: dict[str, dict] = field(default_factory=dict)
+    self_display_name: str = ""
 
 
 @dataclass
@@ -56,6 +62,7 @@ def decide_inbound(
     conversation_type: Optional[str] = None,
     cfg: Optional[AccessPolicyConfig] = None,
     owner_member_id: str = "",
+    sender_owner_member_id: str = "",
 ) -> AccessDecision:
     cfg = cfg or AccessPolicyConfig()
     conv_type = (conversation_type or msg.conversation_type or "dm").lower()
@@ -69,7 +76,11 @@ def decide_inbound(
 
     if msg.sender_type == "agent":
         if conv_type == "dm":
-            if cfg.allow_sibling_dm:
+            if (
+                cfg.allow_sibling_dm
+                and owner_member_id
+                and sender_owner_member_id == owner_member_id
+            ):
                 return AccessDecision(True, "sibling_dm_allowed")
             return AccessDecision(False, "agent_dm_blocked")
         # Group: an agent sender only triggers us when explicitly allowed AND
@@ -93,9 +104,26 @@ def decide_inbound(
 
     # Group / broadcast / bridge conversations.
     mentioned = _is_mentioned(msg, self_member_id)
+    if not mentioned and cfg.self_display_name:
+        mentioned = (
+            f"@{cfg.self_display_name}".casefold() in (msg.text or "").casefold()
+        )
     if is_owner and mentioned:
         return AccessDecision(True, "group_owner_mention")  # owner @-bypass
-    if not cfg.group_require_mention:
+    group = cfg.group_configs.get(msg.conversation_id)
+    policy = (cfg.group_policy or "open").lower()
+    if policy == "disabled":
+        return AccessDecision(False, "group_disabled")
+    if policy == "allowlist" and group is None:
+        return AccessDecision(False, "group_not_allowlisted")
+    group = group or {}
+    allow_from = [str(v) for v in group.get("allow_from") or []]
+    if allow_from and "*" not in allow_from and msg.sender_id not in allow_from:
+        return AccessDecision(False, "group_sender_not_allowed")
+    mode = str(group.get("mode") or "").lower()
+    if mode == "silent":
+        return AccessDecision(False, "group_silent")
+    if mode == "smart" or not cfg.group_require_mention:
         return AccessDecision(True, "group_open")
     if mentioned:
         return AccessDecision(True, "group_mention")

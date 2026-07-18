@@ -1,4 +1,5 @@
 """Normalized domain types exchanged between SDK and adapter."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
