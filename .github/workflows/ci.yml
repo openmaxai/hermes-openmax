@@ -1,0 +1,96 @@
+name: CI
+
+# Required gate for the production branch (main).
+# Every PR targeting main must pass all three jobs below (SAST, secret scan,
+# tests) before it can be merged. Configure these as required status checks in
+# the repository's branch-protection rules for `main`.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # SAST — Semgrep OSS (no login / no token / no metrics required)
+  # False positives may be suppressed inline with a `# nosemgrep: <rule-id>`
+  # comment, ONLY after the project leader confirms it is a false positive.
+  # Bypassing a real finding just to make CI green is prohibited.
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (Semgrep OSS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Semgrep
+        run: pip install "semgrep==1.170.0"
+      - name: Run Semgrep
+        # --error   -> non-zero exit (fails the job) when findings remain
+        # --metrics=off -> OSS mode, no data sent to Semgrep cloud
+        # nosemgrep inline comments are honored automatically.
+        run: |
+          semgrep scan \
+            --config=p/python \
+            --config=p/security-audit \
+            --config=p/secrets \
+            --error \
+            --metrics=off \
+            --disable-version-check
+
+  # ---------------------------------------------------------------------------
+  # Secret scanning — Gitleaks CLI (open-source, no license needed for CLI)
+  # Verified false positives can be allow-listed in .gitleaks.toml or with an
+  # inline `# gitleaks:allow` comment — again, only after leader confirmation.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so gitleaks can scan all commits
+      - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: "8.21.2"
+        run: |
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Run Gitleaks
+        run: gitleaks detect --source . --redact --no-banner --verbose
+
+  # ---------------------------------------------------------------------------
+  # Automated tests — pytest via uv (matches local dev tooling)
+  # `live` tests need a real OpenMax + running Hermes gateway; excluded in CI.
+  # Gateway-host-dependent modules self-skip when `gateway` is not importable
+  # (see tests/conftest.py) and run automatically inside a real Hermes env.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.29"
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Sync dependencies
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
+      - name: Run tests
+        run: uv run --python ${{ matrix.python-version }} pytest -m "not live" -q

@@ -1,0 +1,16 @@
+# Gitleaks configuration for hermes-openmax.
+#
+# Extends the built-in default ruleset. The scan currently reports zero leaks,
+# so there is no blanket allowlist on purpose — add entries here ONLY for
+# confirmed false positives, after the project leader has approved them, and
+# keep each entry as narrow as possible with a comment explaining why it is safe.
+# For one-off cases prefer an inline `# gitleaks:allow` comment instead.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Confirmed false positives (leader-approved only)"
+# Example (commented out — add real, narrowly-scoped entries as needed):
+# regexes = ['''EXAMPLE_PLACEHOLDER_TOKEN_[A-Z0-9]+''']
+# paths = ['''(^|/)tests/fixtures/sample_config\.json$''']
