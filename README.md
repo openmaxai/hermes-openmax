@@ -86,101 +86,43 @@ contains no real organization, invitation, or credential data.
 ~~~markdown
 # OpenMax Agent Onboarding for Hermes
 
-## Step 1: Install
+请实际完成 Hermes 的 OpenMax 插件安装、Agent 注册、邀请接受、Gateway 启动和连接验证。不要只解释步骤，也不要安装或配置 `zylos-openmax`。
+
+## 安全与执行要求
+
+- 不得输出 API key、access token、refresh token、邀请 token、JWT、WebSocket ticket 或完整 `.env`。
+- 不得把任何密钥写入日志、代码仓库、测试文件或最终报告。
+- 所有配置只能写入 `hermes config env-path` 返回的当前 Hermes profile 环境文件。
+- 如果当前 profile 已有有效 `CWS_API_KEY`，复用它；不要重复注册。
+- 直接调用 OpenMax HTTP API 时从 D8 `data` 读取结果；Hermes OpenMax SDK 返回的 `result` 已经是解包后的 D8 `data`。
+- 不得调用 `/channel-liveness` 验证 OpenMax 连接。CWS WebSocket 是传输连接，不是 IM channel。
+
+## Install → Register → Accept → Start → Verify
 
 ```bash
-uv pip install 'git+https://github.com/openmaxai/hermes-openmax.git'
+hermes plugins install openmaxai/hermes-openmax --enable
+# 仓库简写不可用时：
+# hermes plugins install https://github.com/openmaxai/hermes-openmax.git --enable
+hermes plugins list --plain --no-bundled
+ENV_PATH="$(hermes config env-path)"
+touch "$ENV_PATH"
+chmod 600 "$ENV_PATH"
 ```
 
-Or install a local checkout:
+配置并注册 `<CWS_BFF_URL>`、`<CWS_WS_URL>`、`<ORG_ID>`。若没有有效 `CWS_API_KEY`，使用 `register_agent()` 注册并立即把一次性 API key 安全写入当前 profile；然后通过 `data.access_token` 交换短期 token，使用 `accept_invitation()` 接受 `<INVITATION_ID>` / `<INVITATION_TOKEN>`，确认返回的 `org_id`，并写入 `CWS_MEMBER_ID`。不要打印任何 secret。
 
-```bash
-uv pip install -e /path/to/hermes-openmax
-```
+Gateway 未安装时执行 `hermes gateway install --start-now`；已安装时执行 `hermes gateway restart`。确认日志中有 `cws connected` 和 `online-report ok`，并检查服务端 `online_status=online`。不要仅凭 Gateway running 判断连接成功，也不要调用 `/channel-liveness`。
 
-## Step 2: Configure Hermes
+消息验证必须确认 `inbound message: platform=cws` → `response ready: platform=cws` → 发送成功 → 会话历史存在 Agent 回复。群组 smart mode 无需回复时只返回 `[SKIP]`。`/reset` 只在当前 session 未识别新插件时使用，不是建立 Gateway 连接的必要步骤。
 
-Enable the plugin in `~/.hermes/config.yaml`:
-
-```yaml
-plugins:
-  enabled:
-    - hermes-openmax
-```
-
-During onboarding, fill in the connection values as follows:
-
-| Value | Hermes setting |
-|---|---|
-| cws-core REST URL (`bff_url`) | `<CWS_BFF_URL>` |
-| cws-comm WebSocket URL (`ws_url`) | `<CWS_WS_URL>` |
-| `identity_id` | _(leave blank — auto-register)_ |
-| `api_key` | _(leave blank — auto-register; store the generated key in Hermes `.env`)_ |
-| `member_id` | _(leave blank — resolve after registration)_ |
-| `org_id` | `<ORG_ID>` |
-
-The onboarding/installer flow is responsible for registering the external
-agent identity and writing the generated API key to the local Hermes secret
-store. The API key must never be printed, pasted into chat, or committed.
-
-The resulting local environment is conceptually:
-
-```dotenv
-CWS_BFF_URL=<CWS_BFF_URL>
-CWS_WS_URL=<CWS_WS_URL>
-CWS_ORG_ID=<ORG_ID>
-CWS_API_KEY=<GENERATED_API_KEY>
-# Optional after registration:
-# CWS_IDENTITY_ID=<IDENTITY_ID>
-# CWS_MEMBER_ID=<MEMBER_ID>
-```
-
-## Step 3: Accept Invitation
-
-Exchange the generated API key for a short-lived access token, then accept
-the invitation. The onboarding runtime must substitute these placeholders;
-do not expose them in the final report:
-
-```bash
-ACCESS_TOKEN=$(curl -fsS -X POST `<CWS_BFF_URL>/auth/agent/token` \
-  -H "Authorization: Bearer <GENERATED_API_KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-
-curl -fsS -X POST \
-  "<CWS_BFF_URL>/api/v1/invitations/<INVITATION_ID>/accept" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"token":"<INVITATION_TOKEN>"}'
-
-unset ACCESS_TOKEN
-```
-
-## Step 4: Start and verify
-
-```bash
-hermes gateway restart
-hermes gateway status
-grep -i "cws connected" ~/.hermes/logs/gateway.log
-```
-
-Expected behavior:
-
-- Each OpenMax DM uses its own Hermes DM session.
-- Each OpenMax group uses one shared conversation-scoped Hermes session.
-- OpenMax Agent Policy controls DM/group admission, mention, smart, silent,
-  group scope, group allowlist, and allow-from.
-- In group smart mode, reply with exactly `[SKIP]` when no response is needed.
-- Never report API keys, access tokens, invitation tokens, WS tickets, or
-  signed artifact URLs.
+最终只报告安装、启用、注册/邀请、CWS connected、online-report、OpenMax online status、Message E2E、identity/member/org ID、Gateway 和脱敏错误；不得报告任何密钥或 token。
 ~~~
 
-`<CWS_BFF_URL>`, `<CWS_WS_URL>`, `<ORG_ID>`, `<INVITATION_ID>`, and
-`<INVITATION_TOKEN>` are placeholders only. The Buy Agent/onboarding service
-must substitute them when generating an invitation. `api_key` is intentionally
-blank in the template because the onboarding flow is expected to auto-register
-the external identity and provision the generated key; the generated secret
-belongs in Hermes' local `.env`, never in this README.
+
+The Buy Agent/onboarding service must substitute the placeholders when
+rendering the invitation. Invitation tokens are delivered only to the target
+onboarding session. The generated API key belongs in Hermes' local `.env`,
+never in this README.
 
 ## Development
 
