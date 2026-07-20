@@ -1,6 +1,16 @@
-.venv/
+# Local agent/editor state. Keep repository-specific source and tests at root.
+.claude/
+
+# Python and test caches
 __pycache__/
-*.pyc
-*.egg-info/
-dist/
+*.py[cod]
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
