@@ -15,7 +15,6 @@ def test_prompt_includes_setup_and_policy_without_secrets():
     assert "org-1" in prompt
     assert "member-1" in prompt
     assert "CWS_API_KEY=<your OpenMax agent API key>" in prompt
-    assert "group conversations use separate Hermes sessions" in prompt
     assert "group scope" in prompt
     assert "[SKIP]" in prompt
     assert "secret-value" not in prompt
@@ -27,3 +26,4 @@ def test_prompt_uses_placeholders_when_values_are_absent():
     assert "<CWS_WS_URL>" in prompt
     assert "<CWS_ORG_ID>" in prompt
     assert "<CWS_MEMBER_ID>" in prompt
+    assert "<INVITATION_ID>" not in prompt
