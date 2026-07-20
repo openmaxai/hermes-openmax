@@ -1,5 +1,9 @@
 """Tests for the copyable Buy Agent onboarding prompt."""
 
+import subprocess
+import sys
+from pathlib import Path
+
 from hermes_openmax.prompt import build_prompt
 
 
@@ -71,6 +75,27 @@ def test_prompt_uses_safe_placeholders_without_invitation_values():
     assert "Bearer ***" not in prompt
     assert "<GENER...KEY>" not in prompt
     assert "storage.googleapis.com" not in prompt
+
+
+def test_cli_script_loads_current_checkout_and_renders_complete_prompt():
+    root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts" / "generate_openmax_prompt.py"),
+            "--org-id",
+            "org-cli",
+            "--invitation-id",
+            "invite-cli",
+        ],
+        cwd="/",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "hermes plugins install openmaxai/hermes-openmax --enable" in completed.stdout
+    assert "org-cli" in completed.stdout
+    assert "invite-cli" in completed.stdout
 
 
 def test_prompt_does_not_treat_openmax_transport_as_im_channel():
