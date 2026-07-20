@@ -76,23 +76,111 @@ hermes gateway status
 grep -i "cws connected" ~/.hermes/logs/gateway.log
 ```
 
-### Generate an onboarding prompt
+### OpenMax Agent onboarding prompt template
 
-For a new Hermes installation, generate a copyable setup prompt instead of
-manually composing the instructions:
+The OpenMax **Buy Agent** flow can place a copyable prompt like the following
+in the invitation. This is a documentation template: replace only the
+placeholder values when the platform renders the invitation. It intentionally
+contains no real organization, invitation, or credential data.
+
+~~~markdown
+# OpenMax Agent Onboarding for Hermes
+
+## Step 1: Install
 
 ```bash
-python scripts/generate_openmax_prompt.py \
-  --bff-url https://<openmax-bff> \
-  --ws-url wss://<openmax-comm>/ws \
-  --org-id <org_id> \
-  --member-id <agent_member_id>
+uv pip install 'git+https://github.com/openmaxai/hermes-openmax.git'
 ```
 
-The generated prompt never asks the agent to print or commit `CWS_API_KEY`.
-It explains installation, Gateway restart, verification, DM/group session
-semantics, OpenMax Agent Policy, `[SKIP]`, and credential safety. You can also
-run it with no arguments to receive a placeholder template.
+Or install a local checkout:
+
+```bash
+uv pip install -e /path/to/hermes-openmax
+```
+
+## Step 2: Configure Hermes
+
+Enable the plugin in `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - hermes-openmax
+```
+
+During onboarding, fill in the connection values as follows:
+
+| Value | Hermes setting |
+|---|---|
+| cws-core REST URL (`bff_url`) | `<CWS_BFF_URL>` |
+| cws-comm WebSocket URL (`ws_url`) | `<CWS_WS_URL>` |
+| `identity_id` | _(leave blank — auto-register)_ |
+| `api_key` | _(leave blank — auto-register; store the generated key in Hermes `.env`)_ |
+| `member_id` | _(leave blank — resolve after registration)_ |
+| `org_id` | `<ORG_ID>` |
+
+The onboarding/installer flow is responsible for registering the external
+agent identity and writing the generated API key to the local Hermes secret
+store. The API key must never be printed, pasted into chat, or committed.
+
+The resulting local environment is conceptually:
+
+```dotenv
+CWS_BFF_URL=<CWS_BFF_URL>
+CWS_WS_URL=<CWS_WS_URL>
+CWS_ORG_ID=<ORG_ID>
+CWS_API_KEY=<GENERATED_API_KEY>
+# Optional after registration:
+# CWS_IDENTITY_ID=<IDENTITY_ID>
+# CWS_MEMBER_ID=<MEMBER_ID>
+```
+
+## Step 3: Accept Invitation
+
+Exchange the generated API key for a short-lived access token, then accept
+the invitation. The onboarding runtime must substitute these placeholders;
+do not expose them in the final report:
+
+```bash
+ACCESS_TOKEN=$(curl -fsS -X POST `<CWS_BFF_URL>/auth/agent/token` \
+  -H "Authorization: Bearer <GENERATED_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+
+curl -fsS -X POST \
+  "<CWS_BFF_URL>/api/v1/invitations/<INVITATION_ID>/accept" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"token":"<INVITATION_TOKEN>"}'
+
+unset ACCESS_TOKEN
+```
+
+## Step 4: Start and verify
+
+```bash
+hermes gateway restart
+hermes gateway status
+grep -i "cws connected" ~/.hermes/logs/gateway.log
+```
+
+Expected behavior:
+
+- Each OpenMax DM uses its own Hermes DM session.
+- Each OpenMax group uses one shared conversation-scoped Hermes session.
+- OpenMax Agent Policy controls DM/group admission, mention, smart, silent,
+  group scope, group allowlist, and allow-from.
+- In group smart mode, reply with exactly `[SKIP]` when no response is needed.
+- Never report API keys, access tokens, invitation tokens, WS tickets, or
+  signed artifact URLs.
+~~~
+
+`<CWS_BFF_URL>`, `<CWS_WS_URL>`, `<ORG_ID>`, `<INVITATION_ID>`, and
+`<INVITATION_TOKEN>` are placeholders only. The Buy Agent/onboarding service
+must substitute them when generating an invitation. `api_key` is intentionally
+blank in the template because the onboarding flow is expected to auto-register
+the external identity and provision the generated key; the generated secret
+belongs in Hermes' local `.env`, never in this README.
 
 ## Development
 
