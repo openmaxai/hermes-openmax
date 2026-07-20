@@ -81,6 +81,17 @@ class _SdkLogger:
 class CwsAdapter(BasePlatformAdapter):
     """OpenMax Workspace (CWS) adapter."""
 
+    @property
+    def authorization_is_upstream(self) -> bool:
+        """CWS authenticates and applies Agent Policy before delivery.
+
+        In particular, group events intentionally omit ``user_id`` so every
+        member shares one conversation-scoped Hermes session.  The gateway
+        must not reinterpret that deliberate shape as an anonymous,
+        unpaired user after the CWS policy has admitted the event.
+        """
+        return True
+
     _last_instance: Optional["CwsAdapter"] = None
 
     def __init__(self, config, **kwargs):
@@ -273,6 +284,7 @@ class CwsAdapter(BasePlatformAdapter):
             user_id=(msg.sender_id or None) if msg.conversation_type == "dm" else None,
             user_name=msg.sender_name or None,
             is_bot=(msg.sender_type == "agent"),
+            role_authorized=(msg.conversation_type != "dm"),
             message_id=msg.message_id,
         )
         self_member = self._bridge._cfg.member_id if self._bridge else ""
@@ -293,6 +305,7 @@ class CwsAdapter(BasePlatformAdapter):
             metadata={
                 "cws_org_id": msg.org_id,
                 "cws_seq": msg.seq,
+                "cws_inbox_seq": msg.metadata.get("cws_inbox_seq"),
                 **msg.metadata,
             },
             channel_prompt=self._orientation or None,

@@ -576,10 +576,23 @@ class CwsBridge:
         self._inflight.add(key)
         try:
             detail = await self.comm.get_message(conversation_id, message_id)
+            # /sync carries the org-level inbox watermark in event.seq.  A
+            # realtime message frame may carry only a conversation-local seq;
+            # use detail.inbox_seq when the server provides it and otherwise do
+            # not advance the global cursor from the realtime frame.
+            detail_inbox = detail.get("inbox_seq") or (
+                (detail.get("message") or {}).get("inbox_seq")
+                if isinstance(detail.get("message"), dict)
+                else None
+            )
+            inbox_seq = int(seq or 0) if frame is None else int(detail_inbox or 0)
+            if inbox_seq > 0:
+                detail = dict(detail)
+                detail["_inbox_seq"] = inbox_seq
             msg = self._normalize(detail, conversation_id, seq)
             if msg is None:
                 self._mark_seen(key)
-                await self._advance(conversation_id, seq)
+                await self._advance(conversation_id, seq, inbox_seq=seq)
                 return
             conv_info = await self._conversation_info(conversation_id)
             msg.conversation_type = conv_info["type"]
@@ -645,7 +658,7 @@ class CwsBridge:
                     except CwsApiError as exc:
                         self._log.warn("overdue notice failed:", exc)
                 self._mark_seen(key)
-                await self._advance(conversation_id, msg.seq or seq)
+                await self._advance(conversation_id, msg.seq or seq, inbox_seq=seq)
                 return
             if not decision.handle:
                 self._log.log(
@@ -655,13 +668,13 @@ class CwsBridge:
                     conversation_id, msg, decision.reason
                 )
                 self._mark_seen(key)
-                await self._advance(conversation_id, msg.seq or seq)
+                await self._advance(conversation_id, msg.seq or seq, inbox_seq=seq)
                 return
             await self._ack_received(conversation_id, str(message_id))
             # Delivery point — exceptions propagate, watermark stays put, /sync replays.
             await self._on_message(msg)
             self._mark_seen(key)
-            await self._advance(conversation_id, msg.seq or seq)
+            await self._advance(conversation_id, msg.seq or seq, inbox_seq=seq)
         finally:
             self._inflight.discard(key)
 
@@ -705,6 +718,8 @@ class CwsBridge:
             return None
         text = self._extract_text(m, content)
         extra_meta = dict(m.get("metadata") or {})
+        if detail.get("_inbox_seq") is not None:
+            extra_meta["cws_inbox_seq"] = int(detail["_inbox_seq"])
         mentions = (
             m.get("mentions")
             or m.get("mention_user_ids")
@@ -943,18 +958,21 @@ class CwsBridge:
 
     # -- watermarks ---------------------------------------------------------
 
-    async def _advance(self, conversation_id: str, seq: int) -> None:
-        if seq <= 0:
+    async def _advance(
+        self, conversation_id: str, conversation_seq: int, *, inbox_seq: int = 0
+    ) -> None:
+        if conversation_seq <= 0 and inbox_seq <= 0:
             return
-        try:
-            await self.comm.mark_read(conversation_id, seq)
-        except CwsApiError as exc:
-            self._log.warn("mark_read failed:", exc)
-        if seq > self._sync_seq:
-            self._sync_seq = seq
-            self._storage.write_json(_SYNC_SEQ_KEY, {"seq": seq})
+        if conversation_seq > 0:
             try:
-                await self._sync_ack(seq)
+                await self.comm.mark_read(conversation_id, conversation_seq)
+            except CwsApiError as exc:
+                self._log.warn("mark_read failed:", exc)
+        if inbox_seq > self._sync_seq:
+            self._sync_seq = inbox_seq
+            self._storage.write_json(_SYNC_SEQ_KEY, {"seq": inbox_seq})
+            try:
+                await self._sync_ack(inbox_seq)
             except CwsApiError as exc:
                 self._log.warn("sync_ack failed:", exc)
 

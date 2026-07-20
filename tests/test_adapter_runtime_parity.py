@@ -106,6 +106,31 @@ async def test_non_system_conversation_remains_writable():
     assert len(adapter._bridge.sent) == 1
 
 
+def test_cws_adapter_delegates_authorization_to_openmax():
+    adapter = _adapter()
+    assert adapter.authorization_is_upstream is True
+
+
+@pytest.mark.asyncio
+async def test_group_source_is_role_authorized_without_member_user_id():
+    adapter = _adapter()
+    message = InboundMessage(
+        message_id="group-m-1",
+        conversation_id="group-1",
+        org_id="org-1",
+        text="hello",
+        sender_id="human-1",
+        sender_type="human",
+        conversation_type="group",
+    )
+
+    await adapter._on_inbound(message)
+
+    assert adapter.events[-1].source.chat_type == "group"
+    assert adapter.events[-1].source.user_id is None
+    assert adapter.events[-1].source.role_authorized is True
+
+
 @pytest.mark.asyncio
 async def test_readonly_system_message_ids_are_bounded():
     adapter = _adapter()
