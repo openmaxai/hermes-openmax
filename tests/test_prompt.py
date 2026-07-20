@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from hermes_openmax.prompt import build_prompt
 
 
@@ -19,6 +21,7 @@ def test_prompt_drives_complete_profile_safe_onboarding():
         owner_name="Leslie",
         owner_member_id="owner-1",
         expires_at="2026-08-01T00:00:00Z",
+        language="en",
     )
 
     for expected in (
@@ -29,12 +32,12 @@ def test_prompt_drives_complete_profile_safe_onboarding():
         "register_agent",
         "accept_invitation",
         "data.access_token",
-        "SDK 返回的 `result` 已经是解包后的 D8 `data`",
+        "The SDK return value `result` is already the unwrapped D8 `data` object.",
         "hermes gateway install --start-now",
         "hermes gateway restart",
         "cws connected",
         "online-report",
-        "不得调用 `/channel-liveness`",
+        "Do not call `/channel-liveness`",
         "inbound message: platform=cws",
         "response ready: platform=cws",
         "/reset",
@@ -99,8 +102,19 @@ def test_cli_script_loads_current_checkout_and_renders_complete_prompt():
 
 
 def test_prompt_does_not_treat_openmax_transport_as_im_channel():
-    prompt = build_prompt()
-    assert "CWS WebSocket 是传输连接" in prompt
-    assert "不得调用 `/channel-liveness`" in prompt
+    prompt = build_prompt(language="en")
+    assert "CWS WebSocket is transport, not an IM channel" in prompt
+    assert "Do not call `/channel-liveness`" in prompt
     assert "channel_type: openmax" in prompt
     assert "online_status=online" in prompt
+
+
+def test_chinese_prompt_remains_available_explicitly():
+    prompt = build_prompt(language="zh")
+    assert "请实际完成 Hermes 的 OpenMax 插件安装" in prompt
+    assert "不得调用 `/channel-liveness`" in prompt
+
+
+def test_prompt_rejects_unknown_language():
+    with pytest.raises(ValueError, match="language must be"):
+        build_prompt(language="fr")
