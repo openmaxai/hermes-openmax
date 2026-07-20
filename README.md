@@ -35,19 +35,78 @@ replayed via `POST /api/v1/sync` on the next connect.
 ## Install
 
 ```bash
-/Users/you/.hermes/hermes-agent/venv/bin/pip install httpx websockets
+uv pip install 'git+https://github.com/openmaxai/hermes-openmax.git'
+# Or from a checkout:
+uv pip install -e /path/to/hermes-openmax
+# The plugin is discovered through the Hermes entry point. For a directory
+# checkout, this symlink is also supported:
 ln -s /path/to/hermes-openmax/hermes_openmax ~/.hermes/plugins/hermes-openmax
 # enable hermes-openmax in ~/.hermes/config.yaml, then restart:
 hermes gateway restart
 ```
 
-Configure `CWS_BFF_URL`, `CWS_WS_URL`, `CWS_API_KEY`, and optionally `CWS_ORG_ID`.
+Put the secret in `~/.hermes/.env`:
+
+```dotenv
+CWS_API_KEY=<your OpenMax agent API key>
+```
+
+Configure these non-secret connection values in the environment used by the
+Gateway (or your service manager):
+
+```bash
+export CWS_BFF_URL=https://<openmax-bff>
+export CWS_WS_URL=wss://<openmax-comm>/ws
+export CWS_ORG_ID=<org_id>
+export CWS_MEMBER_ID=<agent_member_id> # optional; resolved from /me when absent
+```
+
+Enable the plugin in `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - hermes-openmax
+```
+
+Check the connection:
+
+```bash
+hermes gateway status
+grep -i "cws connected" ~/.hermes/logs/gateway.log
+```
+
+### Generate an onboarding prompt
+
+For a new Hermes installation, generate a copyable setup prompt instead of
+manually composing the instructions:
+
+```bash
+python scripts/generate_openmax_prompt.py \
+  --bff-url https://<openmax-bff> \
+  --ws-url wss://<openmax-comm>/ws \
+  --org-id <org_id> \
+  --member-id <agent_member_id>
+```
+
+The generated prompt never asks the agent to print or commit `CWS_API_KEY`.
+It explains installation, Gateway restart, verification, DM/group session
+semantics, OpenMax Agent Policy, `[SKIP]`, and credential safety. You can also
+run it with no arguments to receive a placeholder template.
 
 ## Development
 
 ```bash
+uv sync --extra dev
 uv run pytest -q
+# Exclude live network tests (the default test run skips them):
+uv run pytest -m 'not live' -q
 ```
+
+Live group smoke tests are explicit opt-in and require a real OpenMax
+environment plus a running Gateway. Set the documented live-test variables in
+your local environment; never paste tokens into chat or commit them. See
+`tests/smoke/test_live_group.py` for the exact variables and command.
 
 ## Current behavior
 
@@ -76,6 +135,12 @@ Knowledge Base CRUD, and `workspace_artifacts` handles uploads/downloads and
 attachments. `workspace_members` provides directory, DM policy, and organization
 management. Connection remains explicitly unsupported: hermes-openmax does not
 register a Connection/`conn` tool and must not request credentials or simulate that surface.
+
+OpenMax group ingress is upstream-authorized by CWS. Group messages therefore
+intentionally have no per-member Hermes `user_id`; this preserves one shared
+session per group while OpenMax enforces group scope, group allowlist,
+allow-from, mention, smart, and silent policy before delivery. DM sessions
+remain user/conversation-scoped.
 
 The bundled `hermes_openmax/skills/` docs preserve role boundaries,
 Issue→Blueprint→Task lifecycle, assignment confirmation, dependency and
