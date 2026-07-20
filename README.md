@@ -135,6 +135,29 @@ rendering the invitation. Invitation tokens are delivered only to the target
 onboarding session. The generated API key belongs in Hermes' local `.env`,
 never in this README.
 
+## Release
+
+The package version is maintained in `pyproject.toml`. Releases use semantic
+version tags such as `v0.1.4`; the GitHub tag and Python package version must
+match. Install the latest repository version with:
+
+```bash
+hermes plugins install openmaxai/hermes-openmax --enable
+```
+
+To reproduce a specific release, install its tag explicitly:
+
+```bash
+hermes plugins install https://github.com/openmaxai/hermes-openmax.git@v0.1.4 --enable
+```
+
+After installing or upgrading a release, restart the Gateway so it reloads the
+plugin:
+
+```bash
+hermes gateway restart
+```
+
 ## Development
 
 ```bash
