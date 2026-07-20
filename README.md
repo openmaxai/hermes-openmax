@@ -215,14 +215,19 @@ your local environment; never paste tokens into chat or commit them. See
 
 ## zylos-openmax parity surfaces
 
-Online reporting, channel-liveness reporting, access policy, DM allowlist management,
-hot updates, runtime metrics, TM/KB/artifact/core/comm services, workspace_comm
+Online reporting, access policy, DM allowlist management, hot updates, runtime
+metrics, TM/KB/artifact/core/comm services, workspace_comm
 attachment delivery, per-conversation progress notifications, and native
 workspace tools are implemented and unit-tested. `workspace_kb` is available for
 Knowledge Base CRUD, and `workspace_artifacts` handles uploads/downloads and
 attachments. `workspace_members` provides directory, DM policy, and organization
 management. Connection remains explicitly unsupported: hermes-openmax does not
 register a Connection/`conn` tool and must not request credentials or simulate that surface.
+
+OpenMax WebSocket connectivity is transport health, not an installed IM channel.
+This adapter therefore does not call the channel-liveness snapshot endpoint. A
+runtime that owns IM channel processes must report its complete catalog-backed
+snapshot (for example, Feishu and Telegram) from their actual process health.
 
 OpenMax group ingress is upstream-authorized by CWS. Group messages therefore
 intentionally have no per-member Hermes `user_id`; this preserves one shared

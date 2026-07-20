@@ -10,7 +10,6 @@ from cws_agent_sdk.http import CwsHttpClient
 from cws_agent_sdk.providers import FileStorage
 from cws_agent_sdk.reporters import (
     BillingGate,
-    ChannelLivenessReporter,
     MetricsReporter,
     OnlineReporter,
 )
@@ -82,38 +81,33 @@ async def test_metrics_report_version_only():
 
 
 @pytest.mark.asyncio
-async def test_channel_liveness_reports_openmax_channel_only():
-    bodies = []
+async def test_bridge_does_not_report_openmax_as_im_channel(tmp_path, monkeypatch):
+    requested_paths = []
 
-    def handler(request):
-        if request.url.path.endswith("/channel-liveness"):
-            import json
+    async def record_request(method, path, **kwargs):
+        requested_paths.append(path)
+        return {}
 
-            bodies.append(json.loads(request.content))
-            return httpx.Response(202, json={"data": {}})
-        raise AssertionError(request.url.path)
+    async def stop_after_tick(_delay):
+        bridge._running = False
 
-    reporter = ChannelLivenessReporter(
-        _http_for(handler),
-        lambda: "me-1",
-        lambda: True,
+    async def on_message(_message):
+        pass
+
+    bridge = CwsBridge(
+        _cfg(),
+        storage=FileStorage(tmp_path),
+        on_message=on_message,
+        billing_gate_enabled=False,
     )
+    monkeypatch.setattr(bridge._http, "request", record_request)
+    monkeypatch.setattr("cws_agent_sdk.bridge.asyncio.sleep", stop_after_tick)
 
-    assert await reporter.report_once() is True
-    assert bodies == [{"channels": [{"channel_type": "openmax", "online": True}]}]
+    bridge._running = True
+    await bridge._metrics_loop()
+    await bridge.stop()
 
-
-@pytest.mark.asyncio
-async def test_channel_liveness_skips_when_health_is_unknown():
-    reporter = ChannelLivenessReporter(
-        _http_for(
-            lambda request: (_ for _ in ()).throw(AssertionError(request.url.path))
-        ),
-        lambda: "me-1",
-        lambda: None,
-    )
-
-    assert await reporter.report_once() is False
+    assert not any(path.endswith("/channel-liveness") for path in requested_paths)
 
 
 @pytest.mark.asyncio
