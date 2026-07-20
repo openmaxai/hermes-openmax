@@ -33,3 +33,6 @@ packages = ["cws_agent_sdk", "hermes_openmax"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: tests that require a real OpenMax environment and running Hermes gateway",
+]

@@ -89,6 +89,26 @@ def detail(msg_id=1, conv="conv-1", seq=10, sender="user-7", text="hello"):
     }
 
 
+def sync_detail(
+    msg_id=1,
+    conv="conv-1",
+    *,
+    conversation_seq=1,
+    inbox_seq=10,
+    sender="user-7",
+    text="hello",
+):
+    value = detail(
+        msg_id=msg_id,
+        conv=conv,
+        seq=conversation_seq,
+        sender=sender,
+        text=text,
+    )
+    value["message"]["inbox_seq"] = inbox_seq
+    return value
+
+
 @pytest.mark.asyncio
 async def test_inbound_delivery_and_watermark(tmp_path):
     got = []
@@ -105,6 +125,27 @@ async def test_inbound_delivery_and_watermark(tmp_path):
     assert got[0].sender_type == "human"
     assert b.comm.read_marks == [("conv-1", 10)]
     assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.asyncio
+async def test_sync_replay_acks_org_inbox_seq_not_conversation_seq(tmp_path):
+    """The global /sync cursor must never be advanced with a per-chat seq."""
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.messages["group-1:1"] = sync_detail(
+        conv="group-1", conversation_seq=1, inbox_seq=201
+    )
+
+    await b._deliver_by_id("group-1", 1, 201)
+
+    assert len(got) == 1
+    assert b.comm.read_marks == [("group-1", 1)]
+    assert b.comm.sync_acks == [201]
+    assert b._sync_seq == 201
 
 
 @pytest.mark.asyncio
