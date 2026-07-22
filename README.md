@@ -35,7 +35,7 @@ replayed via `POST /api/v1/sync` on the next connect.
 ## Install
 
 ```bash
-uv pip install 'git+https://github.com/openmaxai/hermes-openmax.git'
+uv pip install 'git+https://github.com/openmaxai/hermes-openmax.git@v0.1.5'
 # Or from a checkout:
 uv pip install -e /path/to/hermes-openmax
 # The plugin is discovered through the Hermes entry point. For a directory
