@@ -249,7 +249,12 @@ class CwsAdapter(BasePlatformAdapter):
 
     async def _on_config_event(self, event: str, data: Dict[str, Any]) -> None:
         """agent.config.* events the SDK doesn't fully interpret land here."""
-        if event == "agent.config.group_mode_changed":
+        if event == "agent.config.owner_changed":
+            # The bridge emits this only after an authoritative Core read and
+            # has already updated owner_member_id, so rebuild the per-turn
+            # workspace context before the next message arrives.
+            await self._build_orientation()
+        elif event == "agent.config.group_mode_changed":
             conv = str(data.get("conversation_id") or "")
             if conv and str(data.get("mode", "")).lower() != "silent":
                 self._silent_groups.discard(conv)

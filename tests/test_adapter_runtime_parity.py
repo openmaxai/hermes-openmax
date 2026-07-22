@@ -112,6 +112,24 @@ def test_cws_adapter_delegates_authorization_to_openmax():
 
 
 @pytest.mark.asyncio
+async def test_authoritative_owner_change_rebuilds_orientation():
+    adapter = _adapter()
+    rebuilds = []
+
+    async def rebuild_orientation():
+        rebuilds.append(adapter._bridge._cfg.member_id)
+
+    adapter._build_orientation = rebuild_orientation
+
+    await adapter._on_config_event(
+        "agent.config.owner_changed",
+        {"new_owner_member_id": "owner-from-core", "source": "core"},
+    )
+
+    assert rebuilds == ["agent-1"]
+
+
+@pytest.mark.asyncio
 async def test_group_source_is_role_authorized_without_member_user_id():
     adapter = _adapter()
     message = InboundMessage(
