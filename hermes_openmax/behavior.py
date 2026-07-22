@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 from urllib.parse import unquote, urlparse
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -98,3 +98,28 @@ def build_workspace_orientation(
     if persona.strip():
         orientation += f"\n# Workspace persona\n{persona.strip()}"
     return orientation
+
+
+async def build_workspace_orientation_from_core(
+    core: Any,
+    *,
+    owner_id: str = "",
+    persona: str = "",
+    on_owner_lookup_error: Optional[Callable[[Exception], None]] = None,
+) -> str:
+    """Build orientation while treating the owner's display name as cosmetic."""
+    me = await core.me()
+    owner_name = ""
+    if owner_id:
+        try:
+            owner = await core.get_member(owner_id)
+            owner_name = str(owner.get("display_name") or "")
+        except Exception as exc:  # noqa: BLE001 — the owner ID remains authoritative
+            if on_owner_lookup_error:
+                on_owner_lookup_error(exc)
+    return build_workspace_orientation(
+        me,
+        owner_name=owner_name,
+        owner_id=owner_id,
+        persona=persona,
+    )

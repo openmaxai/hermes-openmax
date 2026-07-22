@@ -2,6 +2,7 @@
 
 from hermes_openmax.behavior import (
     build_workspace_orientation,
+    build_workspace_orientation_from_core,
     extract_local_markdown_images,
 )
 
@@ -88,3 +89,30 @@ def test_workspace_orientation_requires_skill_before_classification():
     assert "For EVERY user message received through OpenMax" in orientation
     assert "FIRST load skill_view('hermes-openmax:workspace')" in orientation
     assert "then classify it as task versus Q&A/chat" in orientation
+
+
+async def test_owner_name_failure_still_builds_with_new_owner_id():
+    class Core:
+        async def me(self):
+            return {
+                "display_name": "agent",
+                "member_id": "agent-1",
+                "org_name": "Acme",
+                "org_slug": "acme",
+            }
+
+        async def get_member(self, member_id):
+            assert member_id == "new-owner"
+            raise RuntimeError("temporary owner lookup failure")
+
+    errors = []
+    orientation = await build_workspace_orientation_from_core(
+        Core(),
+        owner_id="new-owner",
+        on_owner_lookup_error=errors.append,
+    )
+
+    assert "member_id new-owner" in orientation
+    assert "old-owner" not in orientation
+    assert "owner is 'unknown'" in orientation
+    assert len(errors) == 1
