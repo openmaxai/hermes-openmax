@@ -78,6 +78,7 @@ class CwsBridge:
         runtime_state: Optional[RuntimeStateProvider] = None,
         billing_gate_enabled: bool = True,
         metrics_interval_s: float = 300.0,
+        control_sync_interval_s: float = 300.0,
         on_config_event: Optional[Callable[[str, dict], Awaitable[None]]] = None,
         ack_reaction: str = "eyes",  # "" disables the received-ack reaction
         ack_reaction_ttl_s: float = 600.0,
@@ -106,7 +107,9 @@ class CwsBridge:
             BillingGate(self._http, logger=self._log) if billing_gate_enabled else None
         )
         self._metrics_interval_s = metrics_interval_s
+        self._control_sync_interval_s = control_sync_interval_s
         self._metrics_task: Optional[asyncio.Task] = None
+        self._control_sync_task: Optional[asyncio.Task] = None
         self._bg_tasks: set[asyncio.Task] = set()
         self._on_config_event = on_config_event
         self._ack_reaction = ack_reaction
@@ -118,7 +121,7 @@ class CwsBridge:
             cfg,
             ticket_provider=self._tokens.get_ws_ticket,
             on_frame=self._handle_frame,
-            on_reconnected=self._sync_missed,
+            on_reconnected=self._on_reconnected,
             on_auth_reset=self._tokens.invalidate,
             logger=self._log,
         )
@@ -147,6 +150,7 @@ class CwsBridge:
             (storage.read_json(_SYNC_SEQ_KEY) or {}).get("seq", 0)
         )
         self._sync_lock = asyncio.Lock()
+        self._owner_sync_lock = asyncio.Lock()
         self._running = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -160,6 +164,9 @@ class CwsBridge:
             await self._online.report(self._cfg.member_id)
             self._metrics_task = asyncio.create_task(
                 self._metrics_loop(), name="cws-metrics"
+            )
+            self._control_sync_task = asyncio.create_task(
+                self._control_sync_loop(), name="cws-control-sync"
             )
         self._ws.start()
         # First install seeks to the inbox end; later starts replay from the
@@ -177,6 +184,9 @@ class CwsBridge:
         if self._metrics_task:
             self._metrics_task.cancel()
             self._metrics_task = None
+        if self._control_sync_task:
+            self._control_sync_task.cancel()
+            self._control_sync_task = None
         for task in list(self._bg_tasks):
             task.cancel()
         await self._ws.stop()
@@ -192,16 +202,49 @@ class CwsBridge:
                 if not self._cfg.org_id:
                     self._cfg.org_id = str(me.get("org_id") or "")
             self._policy.self_display_name = str(me.get("display_name") or "")
-            if self._cfg.member_id:
-                member = await self.core.get_member(self._cfg.member_id)
-                platform_owner = str(member.get("owner_member_id") or "")
-                if platform_owner:
-                    # Platform data is authoritative; keep a first-DM-bound
-                    # owner only while the platform has none.
-                    self.owner_member_id = platform_owner
+            await self._sync_owner_from_core()
             await self._report_policy()
         except CwsApiError as exc:
             self._log.warn("identity/owner resolve failed (non-fatal):", exc)
+
+    async def _sync_owner_from_core(self, *, notify: bool = False) -> bool:
+        """Reconcile the local owner cache from Core's authenticated member view."""
+        member_id = self._cfg.member_id
+        if not member_id:
+            return False
+
+        change: Optional[dict] = None
+        async with self._owner_sync_lock:
+            try:
+                member = await self.core.get_member(member_id)
+            except Exception as exc:  # noqa: BLE001 — control sync is best-effort
+                self._log.warn("owner sync failed; keeping local owner:", exc)
+                return False
+
+            platform_owner = str(member.get("owner_member_id") or "")
+            # Preserve first-DM fallback when Core has no authoritative owner.
+            if not platform_owner or platform_owner == self.owner_member_id:
+                return False
+
+            previous_owner = self.owner_member_id
+            self.owner_member_id = platform_owner
+            self._save_policy_state()
+            self._log.log(
+                "owner synced from Core:",
+                previous_owner or "(none)",
+                "->",
+                platform_owner,
+            )
+            change = {
+                "agent_member_id": member_id,
+                "old_owner_member_id": previous_owner,
+                "new_owner_member_id": platform_owner,
+                "source": "core",
+            }
+
+        if notify and change:
+            await self._notify_config_event("agent.config.owner_changed", change)
+        return change is not None
 
     async def _report_policy(self) -> None:
         if not self._cfg.member_id:
@@ -247,6 +290,29 @@ class CwsBridge:
             except Exception as exc:  # noqa: BLE001 — reporting never breaks the loop
                 self._log.warn("metrics tick failed:", exc)
             await asyncio.sleep(self._metrics_interval_s)
+
+    async def _control_sync_loop(self) -> None:
+        """Heal missed config events on the same five-minute cadence as Zylos."""
+        while self._running:
+            await asyncio.sleep(self._control_sync_interval_s)
+            if not self._running:
+                return
+            await self._sync_owner_from_core(notify=True)
+            await self._report_policy()
+
+    async def _on_reconnected(self) -> None:
+        # Refresh control-plane state before replaying missed user messages.
+        await self._sync_owner_from_core(notify=True)
+        await self._report_policy()
+        await self._sync_missed()
+
+    async def _notify_config_event(self, event: str, data: dict) -> None:
+        if not self._on_config_event:
+            return
+        try:
+            await self._on_config_event(event, data)
+        except Exception as exc:  # noqa: BLE001 — host callback must not kill WS
+            self._log.warn("on_config_event error:", exc)
 
     def is_running(self) -> bool:
         return self._running and self._ws.is_open()
@@ -424,16 +490,14 @@ class CwsBridge:
                 group["allow_from"] = [str(v) for v in data["allow_from"]]
                 self._save_policy_state()
         elif event == "agent.config.owner_changed":
-            self.owner_member_id = str(data.get("new_owner_member_id", ""))
-            self._save_policy_state()
+            # The pushed owner is only a refresh hint. Core's authenticated
+            # member record remains authoritative.
+            await self._sync_owner_from_core(notify=True)
+            return
         # Other events (dm_policy / group_scope / group_allowlist / allowfrom)
         # are forwarded to the adapter callback; interpretation is host policy.
         await self._report_policy()
-        if self._on_config_event:
-            try:
-                await self._on_config_event(event, data)
-            except Exception as exc:  # noqa: BLE001 — host callback must not kill WS
-                self._log.warn("on_config_event error:", exc)
+        await self._notify_config_event(event, data)
 
     async def _deliver_lifecycle_notice(
         self, kind: str, event: str, payload: dict, data: dict

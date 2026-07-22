@@ -186,6 +186,11 @@ your local environment; never paste tokens into chat or commit them. See
   break the underlying task operation.
 - `send(metadata=...)` passes causation/interaction metadata through unchanged;
   the server currently treats that metadata as opaque.
+- Core is authoritative for the Agent owner. The bridge reconciles the local
+  `policy.json` cache at startup, every five minutes, after an internal WebSocket
+  reconnect, and when an `agent.config.owner_changed` refresh hint arrives. A
+  real change updates admission immediately and rebuilds Hermes' workspace
+  orientation; pushed owner IDs are never trusted without the Core read.
 - The plugin surface is covered by unit tests; live deployment verification is
   environment-dependent and is not claimed here.
 

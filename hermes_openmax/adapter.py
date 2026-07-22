@@ -28,7 +28,10 @@ from gateway.platforms.base import (
 from cws_agent_sdk import CwsBridge, CwsConfig, InboundMessage
 from cws_agent_sdk.access_policy import AccessPolicyConfig
 from cws_agent_sdk.providers import FileStorage
-from .behavior import build_workspace_orientation, extract_local_markdown_images
+from .behavior import (
+    build_workspace_orientation_from_core,
+    extract_local_markdown_images,
+)
 
 
 def _policy_from_env() -> AccessPolicyConfig:
@@ -139,22 +142,23 @@ class CwsAdapter(BasePlatformAdapter):
         the agent should know who it is in this org, who its owner is, and
         what workspace capabilities it has)."""
         try:
-            me = await self._bridge.core.me()
-            owner_name = ""
             owner_id = self._bridge.owner_member_id
-            if owner_id:
-                owner = await self._bridge.core.get_member(owner_id)
-                owner_name = str(owner.get("display_name") or "")
             import os
 
-            self._orientation = build_workspace_orientation(
-                me,
-                owner_name=owner_name,
+            self._orientation = await build_workspace_orientation_from_core(
+                self._bridge.core,
                 owner_id=owner_id,
                 persona=os.getenv("CWS_PERSONA", ""),
+                on_owner_lookup_error=lambda exc: logger.warning(
+                    "[cws] owner name lookup failed: %s", exc
+                ),
             )
             logger.info("[cws] orientation built (%d chars)", len(self._orientation))
         except Exception as exc:  # noqa: BLE001 — orientation is an enhancement
+            # Never keep telling the model about an old owner after a failed
+            # refresh. An empty orientation is safer and a later reconnect or
+            # owner reconciliation can rebuild it.
+            self._orientation = ""
             logger.warning("[cws] orientation build failed: %s", exc)
 
     async def disconnect(self) -> None:
@@ -249,7 +253,12 @@ class CwsAdapter(BasePlatformAdapter):
 
     async def _on_config_event(self, event: str, data: Dict[str, Any]) -> None:
         """agent.config.* events the SDK doesn't fully interpret land here."""
-        if event == "agent.config.group_mode_changed":
+        if event == "agent.config.owner_changed":
+            # The bridge emits this only after an authoritative Core read and
+            # has already updated owner_member_id, so rebuild the per-turn
+            # workspace context before the next message arrives.
+            await self._build_orientation()
+        elif event == "agent.config.group_mode_changed":
             conv = str(data.get("conversation_id") or "")
             if conv and str(data.get("mode", "")).lower() != "silent":
                 self._silent_groups.discard(conv)

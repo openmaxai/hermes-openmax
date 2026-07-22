@@ -145,7 +145,7 @@ async def test_config_hot_update_frames(tmp_path):
     events = []
 
     async def on_cfg(event, data):
-        events.append(event)
+        events.append((event, data))
 
     b = CwsBridge(
         _cfg(),
@@ -154,6 +154,11 @@ async def test_config_hot_update_frames(tmp_path):
         billing_gate_enabled=False,
         on_config_event=on_cfg,
     )
+
+    async def get_member(_member_id):
+        return {"owner_member_id": "owner-from-core"}
+
+    b.core.get_member = get_member
 
     def sysframe(event, data):
         return Frame(type=FRAME_SYSTEM, payload={"event": event, "data": data})
@@ -183,10 +188,136 @@ async def test_config_hot_update_frames(tmp_path):
     assert b._effective_policy("c-other").group_require_mention is True
 
     await b._handle_frame(
-        sysframe("agent.config.owner_changed", {"new_owner_member_id": "owner-2"})
+        sysframe("agent.config.owner_changed", {"new_owner_member_id": "forged-owner"})
     )
-    assert b.owner_member_id == "owner-2"
+    assert b.owner_member_id == "owner-from-core"
+    assert FileStorage(tmp_path).read_json("policy.json")["owner_member_id"] == (
+        "owner-from-core"
+    )
     assert len(events) == 4
+    assert events[-1][1]["new_owner_member_id"] == "owner-from-core"
+    assert events[-1][1]["source"] == "core"
+
+
+@pytest.mark.asyncio
+async def test_owner_sync_failure_keeps_last_known_owner(tmp_path):
+    async def on_message(_message):
+        pass
+
+    bridge = CwsBridge(
+        _cfg(),
+        storage=FileStorage(tmp_path),
+        on_message=on_message,
+        billing_gate_enabled=False,
+    )
+    bridge.owner_member_id = "owner-1"
+    bridge._save_policy_state()
+
+    async def fail_get_member(_member_id):
+        raise RuntimeError("Core unavailable")
+
+    bridge.core.get_member = fail_get_member
+    changed = await bridge._sync_owner_from_core(notify=True)
+
+    assert changed is False
+    assert bridge.owner_member_id == "owner-1"
+    assert FileStorage(tmp_path).read_json("policy.json")["owner_member_id"] == (
+        "owner-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_core_without_owner_preserves_first_dm_fallback(tmp_path):
+    async def on_message(_message):
+        pass
+
+    bridge = CwsBridge(
+        _cfg(),
+        storage=FileStorage(tmp_path),
+        on_message=on_message,
+        billing_gate_enabled=False,
+    )
+    bridge.owner_member_id = "first-dm-owner"
+    bridge._save_policy_state()
+
+    async def get_member(_member_id):
+        return {"owner_member_id": ""}
+
+    bridge.core.get_member = get_member
+
+    assert await bridge._sync_owner_from_core(notify=True) is False
+    assert bridge.owner_member_id == "first-dm-owner"
+    assert FileStorage(tmp_path).read_json("policy.json")["owner_member_id"] == (
+        "first-dm-owner"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_refreshes_owner_before_message_sync(tmp_path):
+    async def on_message(_message):
+        pass
+
+    bridge = CwsBridge(
+        _cfg(),
+        storage=FileStorage(tmp_path),
+        on_message=on_message,
+        billing_gate_enabled=False,
+    )
+    calls = []
+
+    async def sync_owner(*, notify=False):
+        calls.append(("owner", notify))
+        return False
+
+    async def report_policy():
+        calls.append(("policy", None))
+
+    async def sync_messages():
+        calls.append(("messages", None))
+
+    bridge._sync_owner_from_core = sync_owner
+    bridge._report_policy = report_policy
+    bridge._sync_missed = sync_messages
+
+    await bridge._on_reconnected()
+
+    assert calls == [("owner", True), ("policy", None), ("messages", None)]
+
+
+@pytest.mark.asyncio
+async def test_periodic_control_sync_heals_owner_and_reports_policy(
+    tmp_path, monkeypatch
+):
+    async def on_message(_message):
+        pass
+
+    bridge = CwsBridge(
+        _cfg(),
+        storage=FileStorage(tmp_path),
+        on_message=on_message,
+        billing_gate_enabled=False,
+    )
+    calls = []
+
+    async def no_delay(_seconds):
+        pass
+
+    async def sync_owner(*, notify=False):
+        calls.append(("owner", notify))
+        bridge._running = False
+        return True
+
+    async def report_policy():
+        calls.append(("policy", None))
+
+    monkeypatch.setattr("cws_agent_sdk.bridge.asyncio.sleep", no_delay)
+    bridge._sync_owner_from_core = sync_owner
+    bridge._report_policy = report_policy
+    bridge._running = True
+
+    await bridge._control_sync_loop()
+
+    assert calls == [("owner", True), ("policy", None)]
 
 
 @pytest.mark.asyncio
