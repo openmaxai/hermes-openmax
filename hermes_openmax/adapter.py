@@ -15,6 +15,7 @@ accepted it.
 from __future__ import annotations
 
 import logging
+import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional
 
@@ -133,7 +134,9 @@ class CwsAdapter(BasePlatformAdapter):
         self._bridge: Optional[CwsBridge] = None
         self._orientation: str = ""
         self._readonly_message_ids: OrderedDict[str, None] = OrderedDict()
-        self._agent_causation: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._agent_causation: "OrderedDict[tuple[str, str], tuple[Dict[str, Any], float]]" = (
+            OrderedDict()
+        )
         CwsAdapter._last_instance = self
 
     # -- lifecycle -----------------------------------------------------
@@ -210,12 +213,23 @@ class CwsAdapter(BasePlatformAdapter):
     # -- outbound: gateway -> CWS ---------------------------------------
 
     def _with_agent_causation(
-        self, chat_id: str, metadata: Optional[Dict[str, Any]]
+        self,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         result = dict(metadata or {})
-        causation_by_chat = getattr(self, "_agent_causation", {})
-        for key, value in causation_by_chat.get(chat_id, {}).items():
-            result.setdefault(key, value)
+        causation = getattr(self, "_agent_causation", {})
+        now = time.monotonic()
+        while causation:
+            _, (_, created_at) = next(iter(causation.items()))
+            if len(causation) <= 2048 and now - created_at < 600:
+                break
+            causation.popitem(last=False)
+        entry = causation.get((chat_id, str(reply_to))) if reply_to else None
+        if entry:
+            for key, value in entry[0].items():
+                result.setdefault(key, value)
         return result
 
     async def send(
@@ -245,7 +259,7 @@ class CwsAdapter(BasePlatformAdapter):
                 conversation_id=chat_id,
                 content=content,
                 reply_to=reply_to,
-                metadata=self._with_agent_causation(chat_id, metadata),
+                metadata=self._with_agent_causation(chat_id, reply_to, metadata),
             )
             return SendResult(success=True, message_id=receipt.message_id)
         except Exception as exc:  # noqa: BLE001 — surface any send failure to gateway
@@ -315,12 +329,11 @@ class CwsAdapter(BasePlatformAdapter):
                 )
                 if msg.metadata.get(key) is not None
             }
-            self._agent_causation[msg.conversation_id] = causation
-            self._agent_causation.move_to_end(msg.conversation_id)
-            while len(self._agent_causation) > 1024:
+            key = (msg.conversation_id, msg.message_id)
+            self._agent_causation[key] = (causation, time.monotonic())
+            self._agent_causation.move_to_end(key)
+            while len(self._agent_causation) > 2048:
                 self._agent_causation.popitem(last=False)
-        else:
-            getattr(self, "_agent_causation", {}).pop(msg.conversation_id, None)
         if msg.sender_type == "system":
             previous = getattr(self, "_readonly_message_ids", ())
             if not isinstance(previous, OrderedDict):
@@ -403,7 +416,7 @@ class CwsAdapter(BasePlatformAdapter):
                 image_path,
                 caption=caption or "",
                 reply_to=reply_to,
-                metadata=self._with_agent_causation(chat_id, metadata),
+                metadata=self._with_agent_causation(chat_id, reply_to, metadata),
             )
             return SendResult(success=True, message_id=receipt.message_id)
         except Exception as exc:  # noqa: BLE001 — fall back to caption-only text
@@ -413,7 +426,7 @@ class CwsAdapter(BasePlatformAdapter):
                     chat_id,
                     f"{caption or ''}\n⚠️ 图片发送失败".strip(),
                     reply_to=reply_to,
-                    metadata=self._with_agent_causation(chat_id, metadata),
+                    metadata=self._with_agent_causation(chat_id, reply_to, metadata),
                 )
                 return SendResult(success=True, message_id=receipt.message_id)
             except Exception as exc2:  # noqa: BLE001
@@ -463,7 +476,9 @@ class CwsAdapter(BasePlatformAdapter):
                     text,
                     reply_to=reply_to,
                     metadata=self._with_agent_causation(
-                        chat_id, {**(metadata or {}), "attachment": node}
+                        chat_id,
+                        reply_to,
+                        {**(metadata or {}), "attachment": node},
                     ),
                 )
                 return SendResult(success=True, message_id=receipt.message_id)
@@ -473,7 +488,7 @@ class CwsAdapter(BasePlatformAdapter):
                 chat_id,
                 text,
                 reply_to=reply_to,
-                metadata=self._with_agent_causation(chat_id, metadata),
+                metadata=self._with_agent_causation(chat_id, reply_to, metadata),
             )
             return SendResult(success=True, message_id=receipt.message_id)
         except Exception as exc:  # noqa: BLE001
@@ -483,7 +498,7 @@ class CwsAdapter(BasePlatformAdapter):
                     chat_id,
                     f"{caption or ''} {image_url}".strip(),
                     reply_to=reply_to,
-                    metadata=self._with_agent_causation(chat_id, metadata),
+                    metadata=self._with_agent_causation(chat_id, reply_to, metadata),
                 )
                 return SendResult(success=True, message_id=receipt.message_id)
             except Exception as exc2:  # noqa: BLE001

@@ -109,7 +109,7 @@ async def test_system_member_inbound_marks_only_that_message_read_only_for_repli
 @pytest.mark.asyncio
 async def test_agent_inbound_causation_is_forwarded_to_outbound_reply():
     adapter = _adapter()
-    inbound = InboundMessage(
+    first = InboundMessage(
         message_id="agent-msg-1",
         conversation_id="agent-dm-1",
         org_id="org-1",
@@ -123,15 +123,44 @@ async def test_agent_inbound_causation_is_forwarded_to_outbound_reply():
             "agent_trace_id": "trace-1",
         },
     )
+    second = InboundMessage(
+        message_id="agent-msg-2",
+        conversation_id="agent-dm-1",
+        org_id="org-1",
+        text="Another request",
+        sender_id="agent-2",
+        sender_type="agent",
+        conversation_type="dm",
+        metadata={"agent_hop_count": 7, "agent_trace_id": "trace-2"},
+    )
+    human = InboundMessage(
+        message_id="human-msg-1",
+        conversation_id="agent-dm-1",
+        org_id="org-1",
+        text="Human interjection",
+        sender_id="human-1",
+        sender_type="human",
+        conversation_type="dm",
+    )
 
-    await adapter._on_inbound(inbound)
+    await adapter._on_inbound(first)
+    await adapter._on_inbound(second)
+    await adapter._on_inbound(human)
     await adapter.send("agent-dm-1", "Done", reply_to="agent-msg-1")
-
     assert adapter._bridge.sent[-1]["metadata"] == {
         "agent_hop_count": 2,
         "agent_origin_member_id": "agent-1",
         "agent_trace_id": "trace-1",
     }
+
+    await adapter.send("agent-dm-1", "Second", reply_to="agent-msg-2")
+    assert adapter._bridge.sent[-1]["metadata"] == {
+        "agent_hop_count": 7,
+        "agent_trace_id": "trace-2",
+    }
+
+    await adapter.send("agent-dm-1", "Proactive")
+    assert adapter._bridge.sent[-1]["metadata"] == {}
 
 
 @pytest.mark.asyncio
