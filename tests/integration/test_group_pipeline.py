@@ -6,7 +6,7 @@ import pytest
 
 from cws_agent_sdk.access_policy import AccessPolicyConfig
 from cws_agent_sdk.bridge import CwsBridge
-from cws_agent_sdk.codec import FRAME_MESSAGE, Frame
+from cws_agent_sdk.codec import FRAME_MESSAGE, FRAME_SYNC, Frame
 from cws_agent_sdk.config import CwsConfig
 from cws_agent_sdk.providers import FileStorage
 from cws_agent_sdk.types import InboundMessage
@@ -128,6 +128,24 @@ async def test_ws_group_frame_reaches_conversation_scoped_gateway_source(tmp_pat
     assert event.source.user_id is None
     assert event.text == "@agent hello"
     assert comm.read_marks == [(conversation_id, 7)]
+    assert comm.sync_acks == []
+
+    await bridge._handle_frame(
+        Frame(
+            type=FRAME_SYNC,
+            org_id="org-1",
+            payload={
+                "events": [
+                    {
+                        "conversation_id": conversation_id,
+                        "message_id": "1001",
+                        "seq": 501,
+                    }
+                ]
+            },
+        )
+    )
+
     assert comm.sync_acks == [501]
 
 

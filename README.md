@@ -38,12 +38,20 @@ replayed via `POST /api/v1/sync` on the next connect.
 uv pip install 'git+https://github.com/openmaxai/hermes-openmax.git@v0.1.5'
 # Or from a checkout:
 uv pip install -e /path/to/hermes-openmax
-# The plugin is discovered through the Hermes entry point. For a directory
-# checkout, this symlink is also supported:
+# The plugin is discovered through the Hermes entry point. For a trusted
+# directory checkout, this symlink is also supported; keep the sibling
+# cws_agent_sdk/ directory in the checkout and install httpx + websockets in
+# the Hermes environment:
 ln -s /path/to/hermes-openmax/hermes_openmax ~/.hermes/plugins/hermes-openmax
 # enable hermes-openmax in ~/.hermes/config.yaml, then restart:
 hermes gateway restart
 ```
+
+Directory loading bootstraps only the checkout's sibling `cws_agent_sdk`
+package. It never installs dependencies at runtime. If that sibling package is
+missing, startup logs an explicit installation error instead of leaving the
+OpenMax platform silently offline. Prefer `hermes plugins install` or the pip
+installation above for managed environments.
 
 Put the secret in `~/.hermes/.env`:
 
@@ -184,8 +192,9 @@ your local environment; never paste tokens into chat or commit them. See
   and deduplicated by conversation, work item, action, and resulting status.
   Missing source context, read-only actions, and notification failures do not
   break the underlying task operation.
-- `send(metadata=...)` passes causation/interaction metadata through unchanged;
-  the server currently treats that metadata as opaque.
+- `send(metadata=...)` preserves caller causation/interaction fields and adds
+  `agent_hop_count`, `agent_origin_member_id`, and `agent_trace_id` for the loop
+  guard; the server currently treats that metadata as opaque.
 - Core is authoritative for the Agent owner. The bridge reconciles the local
   `policy.json` cache at startup, every five minutes, after an internal WebSocket
   reconnect, and when an `agent.config.owner_changed` refresh hint arrives. A
@@ -205,15 +214,40 @@ attachments. `workspace_members` provides directory, DM policy, and organization
 management. Connection remains explicitly unsupported: hermes-openmax does not
 register a Connection/`conn` tool and must not request credentials or simulate that surface.
 
+Human access policy follows the Zylos safety contract: DM defaults to `owner`,
+group scope defaults to `allowlist`, `disabled` blocks every group sender, and
+an owner mention may bypass only a missing group registration. Owners remain
+exempt from a configured group's `allowFrom`. Plain-text mentions use the Core
+display name plus optional `CWS_SELF_ALIASES`, with a boundary check that keeps
+`@Name` from matching `@NameSuffix`.
+
+Agent-to-Agent traffic intentionally has an additional Hermes loop guard. It is
+fail-closed unless the relevant DM/group switch is enabled and the sender is in
+`CWS_ALLOWED_AGENT_SENDERS`; Agent group traffic also requires a structured
+mention and still passes group scope, registration, and `allowFrom`. The bridge
+enforces propagated hop limits plus local duplicate and per-sender/conversation
+turn budgets. Sender identity and structured mentions are authenticated by CWS;
+hop metadata is defense in depth, not an authentication boundary.
+
+`silent` is bridge-only observation: admitted text updates a bounded in-memory
+group history and the sync/read watermarks, but does not download attachments,
+resolve work references, add an ack reaction, invoke billing, create a Hermes
+turn, call the model, or reply. A later admitted message may receive the recent
+bounded history as context. The vendored v1 conformance corpus still represents
+this admission as `handle:true`; `contract/PROVENANCE.md` documents the Hermes
+runtime overlay that consumes it before the host callback.
+
 OpenMax WebSocket connectivity is transport health, not an installed IM channel.
 This adapter therefore does not call the channel-liveness snapshot endpoint. A
 runtime that owns IM channel processes must report its complete catalog-backed
 snapshot (for example, Feishu and Telegram) from their actual process health.
 
-OpenMax group ingress is upstream-authorized by CWS. Group messages therefore
+OpenMax group ingress is authenticated by CWS and then checked by the SDK bridge.
+Group messages therefore
 intentionally have no per-member Hermes `user_id`; this preserves one shared
-session per group while OpenMax enforces group scope, group allowlist,
-allow-from, mention, smart, and silent policy before delivery. DM sessions
+session per group while the bridge enforces group scope, group allowlist,
+allow-from, mention, smart, Agent loop guards, and silent policy before runtime
+delivery. DM sessions
 remain user/conversation-scoped.
 
 The bundled `hermes_openmax/skills/` docs preserve role boundaries,

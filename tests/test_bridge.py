@@ -3,9 +3,10 @@
 import pytest
 
 from cws_agent_sdk.bridge import CwsBridge
-from cws_agent_sdk.codec import FRAME_MESSAGE, Frame
+from cws_agent_sdk.codec import FRAME_MESSAGE, FRAME_SYNC, Frame
 from cws_agent_sdk.config import CwsConfig
 from cws_agent_sdk.providers import FileStorage
+from cws_agent_sdk.types import InboundMessage
 
 
 class FakeComm:
@@ -13,6 +14,7 @@ class FakeComm:
         self.messages = {}
         self.read_marks = []
         self.sync_acks = []
+        self.sent_messages = []
 
     async def get_message(self, conv_id, msg_id):
         return self.messages[f"{conv_id}:{msg_id}"]
@@ -41,6 +43,7 @@ class FakeComm:
     async def send_message(self, conv_id, text, **kw):
         from cws_agent_sdk.types import SendReceipt
 
+        self.sent_messages.append((conv_id, text, kw))
         return SendReceipt(message_id="out-1", conversation_id=conv_id)
 
 
@@ -75,16 +78,31 @@ def msg_frame(msg_id=1, conv="conv-1", seq=10, sender="user-7"):
     )
 
 
-def detail(msg_id=1, conv="conv-1", seq=10, sender="user-7", text="hello"):
+def detail(
+    msg_id=1,
+    conv="conv-1",
+    seq=10,
+    sender="user-7",
+    text="hello",
+    sender_type="HUMAN",
+    mentions=None,
+    metadata=None,
+    include_inbox_seq=True,
+):
+    message = {
+        "id": msg_id,
+        "conversation_id": conv,
+        "seq": seq,
+        "sender_id": sender,
+        "sender_type": sender_type,
+        "client_msg_id": f"cm-{msg_id}",
+        "mentions": mentions or [],
+        "metadata": metadata or {},
+    }
+    if include_inbox_seq:
+        message["inbox_seq"] = seq
     return {
-        "message": {
-            "id": msg_id,
-            "conversation_id": conv,
-            "seq": seq,
-            "sender_id": sender,
-            "sender_type": "HUMAN",
-            "client_msg_id": f"cm-{msg_id}",
-        },
+        "message": message,
         "content": {"content_type": "text", "body": {"text": text}},
     }
 
@@ -124,7 +142,33 @@ async def test_inbound_delivery_and_watermark(tmp_path):
     assert got[0].text == "hello"
     assert got[0].sender_type == "human"
     assert b.comm.read_marks == [("conv-1", 10)]
+    assert b.comm.sync_acks == []
+
+    await b._handle_frame(
+        Frame(
+            type=FRAME_SYNC,
+            payload={"events": [{"conversation_id": "conv-1", "message_id": 1, "seq": 10}]},
+        )
+    )
     assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.asyncio
+async def test_realtime_without_inbox_seq_does_not_advance_global_cursor(tmp_path):
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.messages["conv-1:1"] = detail(seq=7, include_inbox_seq=False)
+
+    await b._handle_frame(msg_frame(seq=7))
+
+    assert len(got) == 1
+    assert b.comm.read_marks == [("conv-1", 7)]
+    assert b.comm.sync_acks == []
+    assert b._sync_seq == 0
 
 
 @pytest.mark.asyncio
@@ -162,6 +206,159 @@ async def test_delivery_failure_keeps_watermark(tmp_path):
     assert b.comm.read_marks == []
     assert b.comm.sync_acks == []
     assert "conv-1:1" not in b._seen
+
+
+@pytest.mark.asyncio
+async def test_external_bridge_default_does_not_gate_on_hosted_llm_billing(tmp_path):
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    cfg = CwsConfig(
+        bff_url="https://bff.test",
+        ws_url="wss://comm.test",
+        api_key="cwsk_x",
+        org_id="org-1",
+        member_id="me-1",
+    )
+    b = CwsBridge(cfg, storage=FileStorage(tmp_path), on_message=on_message)
+    b.comm = FakeComm()
+    b.comm.messages["conv-1:1"] = detail()
+
+    assert b._billing is None
+    await b._handle_frame(msg_frame())
+
+    assert [message.message_id for message in got] == ["1"]
+    assert "conv-1:1" in b._seen
+
+
+@pytest.mark.asyncio
+async def test_sync_replay_never_emits_delayed_billing_notice(tmp_path):
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    class SuspendedBilling:
+        async def is_suspended(self):
+            return True
+
+        def should_send_overdue_notice(self, _conversation_id):
+            return True
+
+    b = make_bridge(tmp_path, on_message)
+    b._billing = SuspendedBilling()
+    b.comm.messages["conv-1:1"] = detail()
+
+    await b._deliver_by_id("conv-1", 1, 10)
+
+    assert got == []
+    assert b.comm.sent_messages == []
+    assert "conv-1:1" in b._seen
+    assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.asyncio
+async def test_sync_replay_never_emits_policy_rejection_notice(tmp_path):
+    b = make_bridge(tmp_path, lambda _message: None)
+    b._policy.dm_policy = "allowlist"
+    b.comm.messages["conv-1:1"] = detail()
+
+    await b._deliver_by_id("conv-1", 1, 10)
+
+    assert b.comm.sent_messages == []
+    assert "conv-1:1" in b._seen
+    assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.asyncio
+async def test_realtime_success_cannot_commit_past_lower_failed_inbox_seq(tmp_path):
+    import asyncio
+
+    low_started = asyncio.Event()
+    release_low = asyncio.Event()
+    attempts = []
+
+    async def on_message(message):
+        attempts.append(message.message_id)
+        if message.message_id == "1" and attempts.count("1") == 1:
+            low_started.set()
+            await release_low.wait()
+            raise RuntimeError("low seq failed")
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.messages["conv-1:1"] = detail(msg_id=1, seq=1)
+    b.comm.messages["conv-1:2"] = detail(msg_id=2, seq=2, text="higher")
+
+    low = asyncio.create_task(b._handle_frame(msg_frame(msg_id=1, seq=1)))
+    await low_started.wait()
+    await b._handle_frame(msg_frame(msg_id=2, seq=2))
+    release_low.set()
+    result = await asyncio.gather(low, return_exceptions=True)
+
+    assert isinstance(result[0], RuntimeError)
+    assert b._sync_seq == 0
+    assert b.comm.sync_acks == []
+    assert "conv-1:1" not in b._seen
+    assert "conv-1:2" in b._seen
+
+    await b._handle_frame(
+        Frame(
+            type=FRAME_SYNC,
+            payload={
+                "events": [
+                    {"conversation_id": "conv-1", "message_id": 1, "seq": 10},
+                    {"conversation_id": "conv-1", "message_id": 2, "seq": 11},
+                ]
+            },
+        )
+    )
+
+    assert attempts == ["1", "2", "1"]
+    assert b._sync_seq == 11
+    assert b.comm.sync_acks == [10, 11]
+
+
+@pytest.mark.parametrize("policy_case", ["silent", "disabled", "unregistered"])
+@pytest.mark.asyncio
+async def test_unknown_conversation_type_fails_closed_and_remains_retryable(
+    tmp_path, policy_case
+):
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    b = make_bridge(tmp_path, on_message)
+    if policy_case == "silent":
+        b._policy.group_configs["conv-1"] = {
+            "mode": "silent",
+            "allow_from": ["*"],
+        }
+        b._group_mode_overrides["conv-1"] = "silent"
+    elif policy_case == "disabled":
+        b._policy.group_policy = "disabled"
+    else:
+        b._policy.group_policy = "allowlist"
+
+    async def fail_conversation_lookup(_conversation_id):
+        raise RuntimeError("conversation service unavailable")
+
+    b.comm.get_conversation = fail_conversation_lookup
+    b.comm.messages["conv-1:1"] = detail(
+        mentions=[{"type": "member", "member_id": "me-1"}]
+    )
+
+    with pytest.raises(RuntimeError, match="conversation service unavailable"):
+        await b._handle_frame(msg_frame())
+
+    assert got == []
+    assert b.owner_member_id == ""
+    assert "conv-1:1" not in b._seen
+    assert "conv-1" not in b._conv_types
+    assert b.comm.read_marks == []
+    assert b.comm.sync_acks == []
 
 
 @pytest.mark.asyncio
@@ -224,7 +421,7 @@ async def test_concurrent_duplicate_delivery_suppressed(tmp_path):
         b._handle_frame(msg_frame()),
     )
     assert len(got) == 1
-    assert b.comm.sync_acks == [10]
+    assert b.comm.sync_acks == []
 
 
 @pytest.mark.asyncio
@@ -255,6 +452,10 @@ async def test_group_smart_mode_and_history_context(tmp_path):
     b = make_bridge(tmp_path, on_message)
     b.comm.conv_type = "group"
     b._group_mode_overrides["conv-1"] = "smart"
+    b._policy.group_configs["conv-1"] = {
+        "mode": "smart",
+        "allow_from": ["*"],
+    }
     b.comm.messages["conv-1:1"] = detail(msg_id=1, seq=10, text="earlier chatter")
     b.comm.messages["conv-1:2"] = detail(msg_id=2, seq=11, text="hello smart")
     await b._handle_frame(msg_frame(msg_id=1, seq=10))
@@ -266,7 +467,7 @@ async def test_group_smart_mode_and_history_context(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_group_silent_mode_observes_without_reply(tmp_path):
+async def test_group_silent_mode_caches_without_model_delivery(tmp_path):
     got = []
 
     async def on_message(m):
@@ -275,11 +476,253 @@ async def test_group_silent_mode_observes_without_reply(tmp_path):
     b = make_bridge(tmp_path, on_message)
     b.comm.conv_type = "group"
     b._group_mode_overrides["conv-1"] = "silent"
+    b._policy.group_configs["conv-1"] = {
+        "mode": "silent",
+        "allow_from": ["*"],
+    }
+
+    async def unexpected_member_lookup(_member_id):
+        raise AssertionError("silent must not resolve sender identity")
+
+    b.core.get_member = unexpected_member_lookup
     b.comm.messages["conv-1:1"] = detail()
     await b._handle_frame(msg_frame())
-    assert len(got) == 1
-    assert got[0].metadata["group_silent"] is True
+    assert got == []
+    assert b._group_history["conv-1"] == ["user-7: hello"]
+    assert getattr(b.comm, "reactions_added", []) == []
+    assert b.comm.sync_acks == []
+    await b._handle_frame(
+        Frame(
+            type=FRAME_SYNC,
+            payload={"events": [{"conversation_id": "conv-1", "message_id": 1, "seq": 10}]},
+        )
+    )
     assert b.comm.sync_acks == [10]  # consumed silently
+
+
+@pytest.mark.asyncio
+async def test_agent_duplicate_and_turn_budget_breakers_consume_without_delivery(tmp_path):
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.conv_type = "group"
+    b._policy.group_policy = "open"
+    b._policy.allow_agent_senders = True
+    b._policy.agent_allowlist = ["agent-1"]
+    b._policy.agent_turn_budget = 2
+    mention = [{"type": "member", "member_id": "me-1"}]
+    b.comm.messages["conv-1:1"] = detail(
+        msg_id=1,
+        sender="agent-1",
+        sender_type="AGENT",
+        mentions=mention,
+        text="same task",
+    )
+    b.comm.messages["conv-1:2"] = detail(
+        msg_id=2,
+        seq=11,
+        sender="agent-1",
+        sender_type="AGENT",
+        mentions=mention,
+        text="same task",
+    )
+    b.comm.messages["conv-1:3"] = detail(
+        msg_id=3,
+        seq=12,
+        sender="agent-1",
+        sender_type="AGENT",
+        mentions=mention,
+        text="different task",
+    )
+    b.comm.messages["conv-1:4"] = detail(
+        msg_id=4,
+        seq=13,
+        sender="agent-1",
+        sender_type="AGENT",
+        mentions=mention,
+        text="third task",
+    )
+
+    await b._handle_frame(msg_frame(msg_id=1, sender="agent-1"))
+    await b._handle_frame(msg_frame(msg_id=2, seq=11, sender="agent-1"))
+    await b._handle_frame(msg_frame(msg_id=3, seq=12, sender="agent-1"))
+    await b._handle_frame(msg_frame(msg_id=4, seq=13, sender="agent-1"))
+
+    assert [message.text for message in got] == ["same task", "different task"]
+    assert b.comm.sync_acks == []
+    await b._handle_frame(
+        Frame(
+            type=FRAME_SYNC,
+            payload={
+                "events": [
+                    {"conversation_id": "conv-1", "message_id": i, "seq": seq}
+                    for i, seq in enumerate(range(10, 14), start=1)
+                ]
+            },
+        )
+    )
+    assert b.comm.sync_acks == [10, 11, 12, 13]
+
+
+@pytest.mark.asyncio
+async def test_agent_hop_limit_is_fail_closed(tmp_path):
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    b = make_bridge(tmp_path, on_message)
+    b.comm.conv_type = "group"
+    b._policy.group_policy = "open"
+    b._policy.allow_agent_senders = True
+    b._policy.agent_allowlist = ["agent-1"]
+    b._policy.max_agent_hops = 2
+    b.comm.messages["conv-1:1"] = detail(
+        sender="agent-1",
+        sender_type="AGENT",
+        mentions=[{"type": "member", "member_id": "me-1"}],
+        metadata={"agent_hop_count": 3},
+    )
+
+    await b._handle_frame(msg_frame(sender="agent-1"))
+
+    assert got == []
+    assert b.comm.sync_acks == []
+    await b._handle_frame(
+        Frame(
+            type=FRAME_SYNC,
+            payload={"events": [{"conversation_id": "conv-1", "message_id": 1, "seq": 10}]},
+        )
+    )
+    assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.parametrize(
+    ("raw_hop", "expected"),
+    [
+        (0, "agent_hop_limit"),
+        (-1, "agent_hop_limit"),
+        (True, "agent_hop_invalid"),
+        (1.5, "agent_hop_invalid"),
+        (None, "agent_hop_invalid"),
+        ("", "agent_hop_invalid"),
+        ("bad", "agent_hop_invalid"),
+    ],
+)
+def test_agent_hop_metadata_is_strictly_validated(tmp_path, raw_hop, expected):
+    b = make_bridge(tmp_path, lambda _message: None)
+    b._policy.max_agent_hops = 4
+    message = InboundMessage(
+        message_id=f"m-{raw_hop!r}",
+        conversation_id="conv-1",
+        org_id="org-1",
+        text="hello",
+        sender_id="agent-1",
+        sender_type="agent",
+        metadata={"agent_hop_count": raw_hop},
+    )
+
+    assert b._agent_loop_rejection(message) == expected
+
+
+def test_missing_agent_hop_metadata_defaults_to_one(tmp_path):
+    b = make_bridge(tmp_path, lambda _message: None)
+    message = InboundMessage(
+        message_id="m-default-hop",
+        conversation_id="conv-1",
+        org_id="org-1",
+        text="hello",
+        sender_id="agent-1",
+        sender_type="agent",
+    )
+
+    assert b._agent_loop_rejection(message) == ""
+
+
+def test_agent_turn_budget_state_expires_and_is_capacity_bounded(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import cws_agent_sdk.bridge as bridge_module
+
+    clock = [0.0]
+    monkeypatch.setattr(
+        bridge_module, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    b = make_bridge(tmp_path, lambda _message: None)
+    b._policy.agent_turn_window_s = 1
+    b._policy.agent_turn_budget = 10
+
+    def message(index):
+        return InboundMessage(
+            message_id=f"m-{index}",
+            conversation_id=f"conv-{index}",
+            org_id="org-1",
+            text=f"task {index}",
+            sender_id=f"agent-{index}",
+            sender_type="agent",
+        )
+
+    for index in range(10):
+        assert b._agent_loop_rejection(message(index)) == ""
+    assert len(b._agent_turns) == 10
+
+    clock[0] = 10.0
+    assert b._agent_loop_rejection(message(10)) == ""
+    assert list(b._agent_turns) == ["conv-10:agent-10"]
+
+    for index in range(11, 2110):
+        assert b._agent_loop_rejection(message(index)) == ""
+    assert len(b._agent_turns) <= 2048
+
+
+@pytest.mark.asyncio
+async def test_agent_delivery_failure_remains_retryable(tmp_path):
+    attempts = []
+
+    async def flaky_delivery(message):
+        attempts.append(message.message_id)
+        if len(attempts) == 1:
+            raise RuntimeError("gateway unavailable")
+
+    b = make_bridge(tmp_path, flaky_delivery)
+    b.comm.conv_type = "group"
+    b._policy.group_policy = "open"
+    b._policy.allow_agent_senders = True
+    b._policy.agent_allowlist = ["agent-1"]
+    b.comm.messages["conv-1:1"] = detail(
+        sender="agent-1",
+        sender_type="AGENT",
+        mentions=[{"type": "member", "member_id": "me-1"}],
+    )
+
+    with pytest.raises(RuntimeError, match="gateway unavailable"):
+        await b._handle_frame(msg_frame(sender="agent-1"))
+    await b._handle_frame(msg_frame(sender="agent-1"))
+
+    assert attempts == ["1", "1"]
+    assert b.comm.sync_acks == []
+    await b._handle_frame(
+        Frame(
+            type=FRAME_SYNC,
+            payload={"events": [{"conversation_id": "conv-1", "message_id": 1, "seq": 10}]},
+        )
+    )
+    assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.asyncio
+async def test_outbound_messages_propagate_agent_loop_metadata(tmp_path):
+    b = make_bridge(tmp_path, lambda _message: None)
+
+    await b.send("conv-1", "reply", metadata={"agent_hop_count": 2})
+
+    metadata = b.comm.sent_messages[-1][2]["metadata"]
+    assert metadata["agent_hop_count"] == 3
+    assert metadata["agent_origin_member_id"] == "me-1"
+    assert metadata["agent_trace_id"]
 
 
 @pytest.mark.asyncio
@@ -304,6 +747,43 @@ async def test_dm_reject_notice_throttled(tmp_path):
     await b._handle_frame(msg_frame(sender="stranger-1"))
     await b._handle_frame(msg_frame(msg_id=2, seq=11, sender="stranger-1"))
     assert len(b.comm.sent) == 1  # one notice, throttled
+
+
+@pytest.mark.asyncio
+async def test_group_reject_notice_requires_live_human_mention(tmp_path):
+    b = make_bridge(tmp_path, lambda _message: None)
+    b.comm.conv_type = "group"
+    b._policy.group_policy = "disabled"
+    b._group_mode_overrides["conv-1"] = "silent"
+    b._policy.group_configs["conv-1"] = {
+        "mode": "silent",
+        "allow_from": ["*"],
+    }
+    mention = [{"type": "member", "member_id": "me-1"}]
+    b.comm.messages["conv-1:1"] = detail(mentions=mention)
+    b.comm.messages["conv-1:2"] = detail(msg_id=2, seq=11, text="background")
+    b.comm.messages["conv-1:3"] = detail(
+        msg_id=3, seq=12, mentions=mention, text="replayed mention"
+    )
+
+    await b._handle_frame(msg_frame())
+    await b._handle_frame(msg_frame(msg_id=2, seq=11))
+    await b._handle_frame(
+        Frame(
+            type=FRAME_SYNC,
+            payload={
+                "events": [
+                    {"conversation_id": "conv-1", "message_id": 1, "seq": 10},
+                    {"conversation_id": "conv-1", "message_id": 2, "seq": 11},
+                    {"conversation_id": "conv-1", "message_id": 3, "seq": 12},
+                ]
+            },
+        )
+    )
+
+    assert len(b.comm.sent_messages) == 1
+    assert "disabled" in b.comm.sent_messages[0][1]
+    assert b.comm.sync_acks == [10, 11, 12]
 
 
 @pytest.mark.asyncio

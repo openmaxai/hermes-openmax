@@ -1,5 +1,7 @@
 """Runtime-only parity regressions for websocket close handling."""
 
+import asyncio
+
 import pytest
 
 from cws_agent_sdk.errors import CwsWsFatal
@@ -54,3 +56,17 @@ def test_close_4003_resets_auth_and_remains_recoverable():
 
     assert auth_resets == [True]
     assert fatals == []
+
+
+@pytest.mark.asyncio
+async def test_initial_connect_wait_propagates_fatal_ws_exit():
+    async def fail_fatally():
+        raise CwsWsFatal(4002, "invalid credentials")
+
+    client = _client()
+    client._task = asyncio.create_task(fail_fatally())
+
+    with pytest.raises(CwsWsFatal) as exc_info:
+        await client.wait_until_connected()
+
+    assert exc_info.value.code == 4002

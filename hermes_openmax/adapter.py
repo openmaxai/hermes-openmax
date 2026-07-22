@@ -14,7 +14,9 @@ accepted it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional
 
@@ -43,6 +45,13 @@ def _policy_from_env() -> AccessPolicyConfig:
             return default
         return raw in ("1", "true", "yes", "on")
 
+    def positive_int(name: str, default: int) -> int:
+        try:
+            value = int(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+        return value if value > 0 else default
+
     allow = [
         s.strip() for s in os.getenv("CWS_ALLOWED_USERS", "").split(",") if s.strip()
     ]
@@ -57,12 +66,34 @@ def _policy_from_env() -> AccessPolicyConfig:
             dm_policy = "allowlist"
         else:
             dm_policy = "owner"
+    group_policy = os.getenv("CWS_GROUP_POLICY", "").strip().lower()
+    if group_policy not in ("open", "allowlist", "disabled"):
+        group_policy = "allowlist"
+    aliases = [
+        value.strip()
+        for value in os.getenv("CWS_SELF_ALIASES", "").split(",")
+        if value.strip()
+    ]
+    agent_allowlist = [
+        value.strip()
+        for value in os.getenv("CWS_ALLOWED_AGENT_SENDERS", "").split(",")
+        if value.strip()
+    ]
     return AccessPolicyConfig(
         dm_policy=dm_policy,
+        group_policy=group_policy,
         group_require_mention=flag("CWS_GROUP_REQUIRE_MENTION", True),
         allow_agent_senders=flag("CWS_ALLOW_AGENT_SENDERS", False),
         allow_sibling_dm=flag("CWS_ALLOW_SIBLING_DM", False),
+        agent_allowlist=agent_allowlist,
+        max_agent_hops=positive_int("CWS_MAX_AGENT_HOPS", 4),
+        agent_turn_budget=positive_int("CWS_AGENT_TURN_BUDGET", 4),
+        agent_turn_window_s=float(positive_int("CWS_AGENT_TURN_WINDOW_S", 60)),
+        agent_duplicate_window_s=float(
+            positive_int("CWS_AGENT_DUPLICATE_WINDOW_S", 60)
+        ),
         dm_allowlist=allow,
+        self_aliases=aliases,
     )
 
 
@@ -104,7 +135,9 @@ class CwsAdapter(BasePlatformAdapter):
         self._bridge: Optional[CwsBridge] = None
         self._orientation: str = ""
         self._readonly_message_ids: OrderedDict[str, None] = OrderedDict()
-        self._silent_groups: set[str] = set()
+        self._agent_causation: "OrderedDict[tuple[str, str], tuple[Dict[str, Any], float]]" = (
+            OrderedDict()
+        )
         CwsAdapter._last_instance = self
 
     # -- lifecycle -----------------------------------------------------
@@ -126,14 +159,24 @@ class CwsAdapter(BasePlatformAdapter):
             policy=_policy_from_env(),
             version=cfg.client_version,
             on_config_event=self._on_config_event,
+            # Hermes owns its model/provider credentials. OpenMax hosted-LLM
+            # organization billing state must never gate external delivery.
+            billing_gate_enabled=False,
             ack_reaction="" if ack.lower() in ("off", "false", "none") else ack,
         )
-        await self._bridge.start()
-        logger.info("[cws] bridge started (org=%s)", cfg.org_id or "<from-token>")
+        try:
+            await self._bridge.start()
+        except (asyncio.CancelledError, Exception):
+            bridge = self._bridge
+            self._bridge = None
+            try:
+                await bridge.stop()
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.warning("[cws] failed-connect cleanup error: %s", cleanup_error)
+            raise
+        logger.info("[cws] bridge connected (org=%s)", cfg.org_id or "<from-token>")
         # Orientation needs several REST calls — build it off the connect path
         # so slow starts don't trip the gateway's connect timeout.
-        import asyncio
-
         asyncio.create_task(self._build_orientation())
         return True
 
@@ -180,6 +223,26 @@ class CwsAdapter(BasePlatformAdapter):
 
     # -- outbound: gateway -> CWS ---------------------------------------
 
+    def _with_agent_causation(
+        self,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        result = dict(metadata or {})
+        causation = getattr(self, "_agent_causation", {})
+        now = time.monotonic()
+        while causation:
+            _, (_, created_at) = next(iter(causation.items()))
+            if len(causation) <= 2048 and now - created_at < 600:
+                break
+            causation.popitem(last=False)
+        entry = causation.get((chat_id, str(reply_to))) if reply_to else None
+        if entry:
+            for key, value in entry[0].items():
+                result.setdefault(key, value)
+        return result
+
     async def send(
         self,
         chat_id: str,
@@ -199,9 +262,7 @@ class CwsAdapter(BasePlatformAdapter):
         if content.strip().upper() == "[SKIP]":
             logger.info("[cws] reply intentionally skipped for %s", chat_id)
             return SendResult(success=True, message_id="")
-        if chat_id in getattr(self, "_silent_groups", set()) or (
-            metadata and metadata.get("group_silent")
-        ):
+        if metadata and metadata.get("group_silent"):
             logger.info("[cws] group silent: suppressing reply for %s", chat_id)
             return SendResult(success=True, message_id="")
         try:
@@ -209,7 +270,7 @@ class CwsAdapter(BasePlatformAdapter):
                 conversation_id=chat_id,
                 content=content,
                 reply_to=reply_to,
-                metadata=metadata,
+                metadata=self._with_agent_causation(chat_id, reply_to, metadata),
             )
             return SendResult(success=True, message_id=receipt.message_id)
         except Exception as exc:  # noqa: BLE001 — surface any send failure to gateway
@@ -258,10 +319,6 @@ class CwsAdapter(BasePlatformAdapter):
             # has already updated owner_member_id, so rebuild the per-turn
             # workspace context before the next message arrives.
             await self._build_orientation()
-        elif event == "agent.config.group_mode_changed":
-            conv = str(data.get("conversation_id") or "")
-            if conv and str(data.get("mode", "")).lower() != "silent":
-                self._silent_groups.discard(conv)
         logger.info(
             "[cws] config event %s: %s", event, {k: data.get(k) for k in list(data)[:6]}
         )
@@ -271,6 +328,23 @@ class CwsAdapter(BasePlatformAdapter):
     async def _on_inbound(self, msg: InboundMessage) -> None:
         """SDK delivery callback. Raising here prevents the ack watermark
         from advancing, so the message is replayed via /sync later."""
+        if msg.sender_type == "agent":
+            if not hasattr(self, "_agent_causation"):
+                self._agent_causation = OrderedDict()
+            causation = {
+                key: msg.metadata[key]
+                for key in (
+                    "agent_hop_count",
+                    "agent_origin_member_id",
+                    "agent_trace_id",
+                )
+                if msg.metadata.get(key) is not None
+            }
+            key = (msg.conversation_id, msg.message_id)
+            self._agent_causation[key] = (causation, time.monotonic())
+            self._agent_causation.move_to_end(key)
+            while len(self._agent_causation) > 2048:
+                self._agent_causation.popitem(last=False)
         if msg.sender_type == "system":
             previous = getattr(self, "_readonly_message_ids", ())
             if not isinstance(previous, OrderedDict):
@@ -281,8 +355,6 @@ class CwsAdapter(BasePlatformAdapter):
             self._readonly_message_ids.move_to_end(msg.message_id)
             while len(self._readonly_message_ids) > 1024:
                 self._readonly_message_ids.popitem(last=False)
-        if msg.metadata.get("group_silent"):
-            self._silent_groups.add(msg.conversation_id)
         # OpenMax groups are conversation-scoped. Do not pass the sender as the
         # session participant, otherwise Hermes creates one session per member
         # instead of one shared session per group.
@@ -351,7 +423,11 @@ class CwsAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id="")
         try:
             receipt = await self._bridge.send_image_file(
-                chat_id, image_path, caption=caption or "", reply_to=reply_to
+                chat_id,
+                image_path,
+                caption=caption or "",
+                reply_to=reply_to,
+                metadata=self._with_agent_causation(chat_id, reply_to, metadata),
             )
             return SendResult(success=True, message_id=receipt.message_id)
         except Exception as exc:  # noqa: BLE001 — fall back to caption-only text
@@ -361,6 +437,7 @@ class CwsAdapter(BasePlatformAdapter):
                     chat_id,
                     f"{caption or ''}\n⚠️ 图片发送失败".strip(),
                     reply_to=reply_to,
+                    metadata=self._with_agent_causation(chat_id, reply_to, metadata),
                 )
                 return SendResult(success=True, message_id=receipt.message_id)
             except Exception as exc2:  # noqa: BLE001
@@ -406,18 +483,33 @@ class CwsAdapter(BasePlatformAdapter):
                 )
                 text = caption or f"[image] {fname}"
                 receipt = await self._bridge.send(
-                    chat_id, text, reply_to=reply_to, metadata={"attachment": node}
+                    chat_id,
+                    text,
+                    reply_to=reply_to,
+                    metadata=self._with_agent_causation(
+                        chat_id,
+                        reply_to,
+                        {**(metadata or {}), "attachment": node},
+                    ),
                 )
                 return SendResult(success=True, message_id=receipt.message_id)
             # Remote URL: no re-hosting — send as markdown image link.
             text = f"![{caption or 'image'}]({image_url})"
-            receipt = await self._bridge.send(chat_id, text, reply_to=reply_to)
+            receipt = await self._bridge.send(
+                chat_id,
+                text,
+                reply_to=reply_to,
+                metadata=self._with_agent_causation(chat_id, reply_to, metadata),
+            )
             return SendResult(success=True, message_id=receipt.message_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[cws] send_image failed, falling back to text: %s", exc)
             try:
                 receipt = await self._bridge.send(
-                    chat_id, f"{caption or ''} {image_url}".strip(), reply_to=reply_to
+                    chat_id,
+                    f"{caption or ''} {image_url}".strip(),
+                    reply_to=reply_to,
+                    metadata=self._with_agent_causation(chat_id, reply_to, metadata),
                 )
                 return SendResult(success=True, message_id=receipt.message_id)
             except Exception as exc2:  # noqa: BLE001

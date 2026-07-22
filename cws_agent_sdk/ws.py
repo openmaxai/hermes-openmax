@@ -89,6 +89,29 @@ class CwsWsClient:
     def is_open(self) -> bool:
         return self._connected.is_set()
 
+    async def wait_until_connected(self) -> None:
+        """Wait for the first real handshake or propagate a fatal WS exit.
+
+        Transient connection errors remain owned by the reconnect loop. The
+        host's platform-connect timeout bounds this wait during adapter startup.
+        """
+        if self._connected.is_set():
+            return
+        task = self._task
+        if task is None:
+            raise RuntimeError("cws ws client has not been started")
+        connected = asyncio.create_task(self._connected.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {connected, task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if connected in done and connected.result():
+                return
+            await task
+            raise ConnectionError("cws ws client stopped before connecting")
+        finally:
+            connected.cancel()
+
     async def send_text(self, text: str) -> None:
         if not self._conn:
             raise ConnectionError("cws ws not connected")

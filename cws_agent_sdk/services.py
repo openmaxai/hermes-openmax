@@ -25,16 +25,24 @@ class AccessPolicyService:
     _KEY = "policy.json"
     _POLICIES = ("open", "allowlist", "owner")
 
-    def __init__(self, storage):
+    def __init__(self, storage, *, get_live_state=None, apply_live_state=None):
         self._storage = storage
+        self._get_live_state = get_live_state
+        self._apply_live_state = apply_live_state
 
     def _state(self) -> dict:
+        if self._get_live_state:
+            return dict(self._get_live_state())
         state = self._storage.read_json(self._KEY)
         return dict(state) if isinstance(state, dict) else {}
 
     def _write(self, state: dict) -> dict:
         state["dm_policy"] = str(state.get("dm_policy") or "owner")
         state["dm_allowlist"] = [str(v) for v in state.get("dm_allowlist") or []]
+        if self._apply_live_state:
+            return self._apply_live_state(
+                state["dm_policy"], state["dm_allowlist"]
+            )
         self._storage.write_json(self._KEY, state)
         return {"dm_policy": state["dm_policy"], "dm_allowlist": state["dm_allowlist"]}
 
@@ -153,6 +161,7 @@ class CommService:
         caption: str = "",
         reply_to: Optional[str] = None,
         client_msg_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ) -> SendReceipt:
         """Send a native IMAGE message referencing a finalized upload."""
         # zylos-openmax hard-won contract: body MUST carry file_name (an empty
@@ -180,6 +189,8 @@ class CommService:
         }
         if reply_to:
             body["parent_id"] = str(reply_to)
+        if metadata:
+            body["metadata"] = metadata
         data = await self._http.post(
             f"/api/v1/conversations/{conversation_id}/messages", json=body
         )

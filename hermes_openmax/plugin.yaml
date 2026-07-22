@@ -31,7 +31,7 @@ optional_env:
     prompt: "Allowed member ids (optional)"
     password: false
   - name: CWS_ALLOW_ALL_USERS
-    description: "Allow all workspace members (default: true — CWS already scopes access by org)"
+    description: "Allow all workspace members to DM the agent (default: false)"
     prompt: "Allow all users? (true/false)"
     password: false
   - name: CWS_HOME_CHANNEL
@@ -50,9 +50,37 @@ optional_env:
     description: "Allow DMs from sibling agents (default: false, prevents agent chat loops)"
     prompt: "Allow sibling agent DMs? (true/false)"
     password: false
+  - name: CWS_ALLOWED_AGENT_SENDERS
+    description: "Comma-separated Agent member ids allowed by the Agent loop guard; '*' allows any Agent after the remaining gates (default: empty/fail-closed)"
+    prompt: "Allowed Agent member ids (optional)"
+    password: false
+  - name: CWS_MAX_AGENT_HOPS
+    description: "Reject Agent messages whose propagated hop count exceeds this value (default: 4)"
+    prompt: "Maximum Agent hops"
+    password: false
+  - name: CWS_AGENT_TURN_BUDGET
+    description: "Maximum admitted Agent messages per sender/conversation window (default: 4)"
+    prompt: "Agent turn budget"
+    password: false
+  - name: CWS_AGENT_TURN_WINDOW_S
+    description: "Agent turn-budget window in seconds (default: 60)"
+    prompt: "Agent turn window seconds"
+    password: false
+  - name: CWS_AGENT_DUPLICATE_WINDOW_S
+    description: "Reject repeated Agent content within this many seconds (default: 60)"
+    prompt: "Agent duplicate window seconds"
+    password: false
   - name: CWS_DM_POLICY
-    description: "DM admission: open | allowlist | owner (default open; platform can change live via agent.config)"
+    description: "Human DM admission: open | allowlist | owner (default: owner; platform can change live via agent.config)"
     prompt: "DM policy (open/allowlist/owner)"
+    password: false
+  - name: CWS_GROUP_POLICY
+    description: "Human group admission: open | allowlist | disabled (default: allowlist; platform can change live via agent.config)"
+    prompt: "Group policy (open/allowlist/disabled)"
+    password: false
+  - name: CWS_SELF_ALIASES
+    description: "Comma-separated stable aliases accepted for plain-text @mentions (optional)"
+    prompt: "Agent mention aliases (optional)"
     password: false
   - name: CWS_PERSONA
     description: "Workspace-specific persona text, appended to the per-turn orientation (base personality stays in SOUL.md)"
