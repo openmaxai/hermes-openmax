@@ -209,6 +209,70 @@ async def test_delivery_failure_keeps_watermark(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_external_bridge_default_does_not_gate_on_hosted_llm_billing(tmp_path):
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    cfg = CwsConfig(
+        bff_url="https://bff.test",
+        ws_url="wss://comm.test",
+        api_key="cwsk_x",
+        org_id="org-1",
+        member_id="me-1",
+    )
+    b = CwsBridge(cfg, storage=FileStorage(tmp_path), on_message=on_message)
+    b.comm = FakeComm()
+    b.comm.messages["conv-1:1"] = detail()
+
+    assert b._billing is None
+    await b._handle_frame(msg_frame())
+
+    assert [message.message_id for message in got] == ["1"]
+    assert "conv-1:1" in b._seen
+
+
+@pytest.mark.asyncio
+async def test_sync_replay_never_emits_delayed_billing_notice(tmp_path):
+    got = []
+
+    async def on_message(message):
+        got.append(message)
+
+    class SuspendedBilling:
+        async def is_suspended(self):
+            return True
+
+        def should_send_overdue_notice(self, _conversation_id):
+            return True
+
+    b = make_bridge(tmp_path, on_message)
+    b._billing = SuspendedBilling()
+    b.comm.messages["conv-1:1"] = detail()
+
+    await b._deliver_by_id("conv-1", 1, 10)
+
+    assert got == []
+    assert b.comm.sent_messages == []
+    assert "conv-1:1" in b._seen
+    assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.asyncio
+async def test_sync_replay_never_emits_policy_rejection_notice(tmp_path):
+    b = make_bridge(tmp_path, lambda _message: None)
+    b._policy.dm_policy = "allowlist"
+    b.comm.messages["conv-1:1"] = detail()
+
+    await b._deliver_by_id("conv-1", 1, 10)
+
+    assert b.comm.sent_messages == []
+    assert "conv-1:1" in b._seen
+    assert b.comm.sync_acks == [10]
+
+
+@pytest.mark.asyncio
 async def test_realtime_success_cannot_commit_past_lower_failed_inbox_seq(tmp_path):
     import asyncio
 

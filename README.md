@@ -38,12 +38,20 @@ replayed via `POST /api/v1/sync` on the next connect.
 uv pip install 'git+https://github.com/openmaxai/hermes-openmax.git@v0.1.5'
 # Or from a checkout:
 uv pip install -e /path/to/hermes-openmax
-# The plugin is discovered through the Hermes entry point. For a directory
-# checkout, this symlink is also supported:
+# The plugin is discovered through the Hermes entry point. For a trusted
+# directory checkout, this symlink is also supported; keep the sibling
+# cws_agent_sdk/ directory in the checkout and install httpx + websockets in
+# the Hermes environment:
 ln -s /path/to/hermes-openmax/hermes_openmax ~/.hermes/plugins/hermes-openmax
 # enable hermes-openmax in ~/.hermes/config.yaml, then restart:
 hermes gateway restart
 ```
+
+Directory loading bootstraps only the checkout's sibling `cws_agent_sdk`
+package. It never installs dependencies at runtime. If that sibling package is
+missing, startup logs an explicit installation error instead of leaving the
+OpenMax platform silently offline. Prefer `hermes plugins install` or the pip
+installation above for managed environments.
 
 Put the secret in `~/.hermes/.env`:
 

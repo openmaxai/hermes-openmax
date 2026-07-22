@@ -7,6 +7,8 @@ import pytest
 from gateway.config import Platform
 
 from cws_agent_sdk.types import InboundMessage
+
+import hermes_openmax.adapter as adapter_module
 from hermes_openmax.adapter import CwsAdapter, _policy_from_env
 
 
@@ -44,6 +46,45 @@ def test_policy_env_loads_agent_allowlist_aliases_and_budgets(monkeypatch):
     assert policy.self_aliases == ["COCO", "helper.bot"]
     assert policy.max_agent_hops == 3
     assert policy.agent_turn_budget == 2
+
+
+@pytest.mark.asyncio
+async def test_adapter_connect_explicitly_disables_hosted_billing_gate(monkeypatch):
+    captured = {}
+
+    class Config:
+        org_id = "org-1"
+        client_version = "test"
+
+        def validate(self):
+            return []
+
+    class Bridge:
+        def __init__(self, cfg, **kwargs):
+            captured.update(kwargs)
+            self._cfg = SimpleNamespace(member_id="agent-1")
+            self.owner_member_id = ""
+            self.core = SimpleNamespace()
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        adapter_module.CwsConfig, "from_env", classmethod(lambda _cls: Config())
+    )
+    monkeypatch.setattr(adapter_module, "CwsBridge", Bridge)
+    adapter = CwsAdapter(SimpleNamespace())
+
+    async def no_orientation():
+        pass
+
+    adapter._build_orientation = no_orientation
+
+    assert await adapter.connect() is True
+    assert captured["billing_gate_enabled"] is False
 
 
 class _Bridge:

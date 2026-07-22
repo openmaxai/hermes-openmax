@@ -1,10 +1,63 @@
-"""Hermes OpenMax prompt and media behavior regressions."""
+"""Hermes OpenMax prompt, install, and media behavior regressions."""
+
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 from hermes_openmax.behavior import (
     build_workspace_orientation,
     build_workspace_orientation_from_core,
     extract_local_markdown_images,
 )
+
+
+def test_directory_plugin_bootstraps_sibling_sdk_in_isolated_python(tmp_path):
+    source_root = Path(__file__).resolve().parents[1]
+    plugin_root = tmp_path / "checkout"
+    shutil.copytree(source_root / "hermes_openmax", plugin_root / "hermes_openmax")
+    shutil.copytree(source_root / "cws_agent_sdk", plugin_root / "cws_agent_sdk")
+    script = textwrap.dedent(
+        f"""
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        plugin_dir = Path({str(plugin_root / 'hermes_openmax')!r})
+        real_find_spec = importlib.util.find_spec
+
+        def directory_install_find_spec(name, *args, **kwargs):
+            if name == "cws_agent_sdk" and str(plugin_dir.parent) not in sys.path:
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        importlib.util.find_spec = directory_install_find_spec
+        module_name = "hermes_plugins.hermes_openmax_directory_test"
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            plugin_dir / "__init__.py",
+            submodule_search_locations=[str(plugin_dir)],
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        module._ensure_bundled_sdk_importable()
+        import cws_agent_sdk
+        assert Path(cws_agent_sdk.__file__).resolve().parent == (
+            plugin_dir.parent / "cws_agent_sdk"
+        ).resolve()
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_extract_local_markdown_images_accepts_existing_file_uri_with_caption(

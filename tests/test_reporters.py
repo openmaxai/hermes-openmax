@@ -60,6 +60,60 @@ async def test_online_report():
 
 
 @pytest.mark.asyncio
+async def test_bridge_reports_online_only_after_first_ws_handshake(tmp_path):
+    import asyncio
+
+    started = asyncio.Event()
+    release_handshake = asyncio.Event()
+    online_reports = []
+
+    class WaitingWs:
+        def start(self):
+            started.set()
+
+        async def wait_until_connected(self):
+            await release_handshake.wait()
+
+        async def stop(self):
+            pass
+
+        def is_open(self):
+            return release_handshake.is_set()
+
+    async def no_op(*_args, **_kwargs):
+        pass
+
+    bridge = CwsBridge(
+        _cfg(), storage=FileStorage(tmp_path), on_message=no_op
+    )
+    bridge._ws = WaitingWs()
+    bridge._tokens.get_access_token = no_op
+    bridge._resolve_identity = no_op
+    bridge._initialize_or_sync = no_op
+    bridge._metrics_loop = no_op
+    bridge._control_sync_loop = no_op
+
+    async def report_online(member_id):
+        online_reports.append(member_id)
+
+    bridge._online.report = report_online
+
+    starting = asyncio.create_task(bridge.start())
+    await started.wait()
+    await asyncio.sleep(0)
+    assert online_reports == []
+    assert not starting.done()
+
+    release_handshake.set()
+    await starting
+    await asyncio.sleep(0)
+
+    assert online_reports == ["me-1"]
+    assert bridge.is_running()
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
 async def test_metrics_report_version_only():
     bodies = []
 

@@ -89,7 +89,7 @@ class CwsBridge:
         policy: Optional[AccessPolicyConfig] = None,
         version: str = "",
         runtime_state: Optional[RuntimeStateProvider] = None,
-        billing_gate_enabled: bool = True,
+        billing_gate_enabled: bool = False,
         metrics_interval_s: float = 300.0,
         control_sync_interval_s: float = 300.0,
         on_config_event: Optional[Callable[[str, dict], Awaitable[None]]] = None,
@@ -179,15 +179,20 @@ class CwsBridge:
         await self._tokens.get_access_token()
         await self._resolve_identity()
         self._running = True
+        self._ws.start()
+        await self._ws.wait_until_connected()
         if self._cfg.member_id:
-            await self._online.report(self._cfg.member_id)
+            # This is a boot/onboarding report, not proof of a model turn. Do
+            # not emit it until the transport has completed a real handshake.
+            self._spawn_bg(
+                self._online.report(self._cfg.member_id), "cws-online-report"
+            )
             self._metrics_task = asyncio.create_task(
                 self._metrics_loop(), name="cws-metrics"
             )
             self._control_sync_task = asyncio.create_task(
                 self._control_sync_loop(), name="cws-control-sync"
             )
-        self._ws.start()
         # First install seeks to the inbox end; later starts replay from the
         # persisted cursor. Both run off the connect path.
         self._spawn_bg(self._initialize_or_sync(), "cws-initial-sync")
@@ -909,7 +914,10 @@ class CwsBridge:
                 and await self._billing.is_suspended()
             ):
                 self._log.warn("billing suspended — skipping delivery", conversation_id)
-                if self._billing.should_send_overdue_notice(conversation_id):
+                if (
+                    frame is not None
+                    and self._billing.should_send_overdue_notice(conversation_id)
+                ):
                     try:
                         await self.comm.send_message(conversation_id, OVERDUE_NOTICE)
                     except CwsApiError as exc:

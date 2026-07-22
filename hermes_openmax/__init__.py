@@ -2,14 +2,55 @@
 
 from __future__ import annotations
 
+import importlib.util
+import logging
 import os
+import sys
+from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_bundled_sdk_importable() -> None:
+    """Expose the sibling SDK for trusted directory-plugin installations."""
+    try:
+        installed_spec = importlib.util.find_spec("cws_agent_sdk")
+    except (ImportError, ValueError):
+        installed_spec = None
+    if installed_spec is not None:
+        return
+    plugin_root = Path(__file__).resolve().parent.parent
+    sdk_init = plugin_root / "cws_agent_sdk" / "__init__.py"
+    if not sdk_init.is_file():
+        message = (
+            "hermes-openmax failed to load: cws_agent_sdk is not importable. "
+            "Install with `hermes plugins install openmaxai/hermes-openmax --enable` "
+            "or `uv pip install` the repository into the Hermes environment."
+        )
+        logger.error(message)
+        raise ModuleNotFoundError(message)
+    root = str(plugin_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    importlib.invalidate_caches()
+    try:
+        bundled_spec = importlib.util.find_spec("cws_agent_sdk")
+    except (ImportError, ValueError):
+        bundled_spec = None
+    if bundled_spec is None:
+        message = f"hermes-openmax found but could not import bundled SDK at {sdk_init}"
+        logger.error(message)
+        raise ModuleNotFoundError(message)
 
 
 def check_requirements() -> bool:
     try:
+        _ensure_bundled_sdk_importable()
         import httpx  # noqa: F401
         import websockets  # noqa: F401
-    except ImportError:
+    except ImportError as exc:
+        logger.error("hermes-openmax dependency check failed: %s", exc)
         return False
     return True
 
@@ -93,7 +134,7 @@ async def _standalone_send(
 
 def register(ctx):
     """Hermes plugin entry point."""
-    from pathlib import Path
+    _ensure_bundled_sdk_importable()
 
     from .adapter import CwsAdapter
     from .tools import ALL_TOOLS

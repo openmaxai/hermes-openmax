@@ -14,6 +14,7 @@ accepted it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import OrderedDict
@@ -158,14 +159,24 @@ class CwsAdapter(BasePlatformAdapter):
             policy=_policy_from_env(),
             version=cfg.client_version,
             on_config_event=self._on_config_event,
+            # Hermes owns its model/provider credentials. OpenMax hosted-LLM
+            # organization billing state must never gate external delivery.
+            billing_gate_enabled=False,
             ack_reaction="" if ack.lower() in ("off", "false", "none") else ack,
         )
-        await self._bridge.start()
-        logger.info("[cws] bridge started (org=%s)", cfg.org_id or "<from-token>")
+        try:
+            await self._bridge.start()
+        except (asyncio.CancelledError, Exception):
+            bridge = self._bridge
+            self._bridge = None
+            try:
+                await bridge.stop()
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.warning("[cws] failed-connect cleanup error: %s", cleanup_error)
+            raise
+        logger.info("[cws] bridge connected (org=%s)", cfg.org_id or "<from-token>")
         # Orientation needs several REST calls — build it off the connect path
         # so slow starts don't trip the gateway's connect timeout.
-        import asyncio
-
         asyncio.create_task(self._build_orientation())
         return True
 
