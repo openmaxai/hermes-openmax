@@ -52,6 +52,7 @@ _DEDUP_MAX = 2048
 _DEDUP_PERSIST_EVERY = 25
 _GROUP_HISTORY_LEN = 10
 _GROUP_CONTEXT_N = 5
+_AGENT_TURN_KEYS_MAX = 2048
 
 DM_REJECT_NOTICE = (
     "你好,我暂时无法处理这条私信(访问策略限制)。请联系我的 owner 开通权限。"
@@ -146,6 +147,7 @@ class CwsBridge:
         )
         self._marks_since_persist = 0
         self._inflight: set[str] = set()
+        self._inflight_done: dict[str, asyncio.Event] = {}
         self._own_client_msg_ids: "OrderedDict[str, None]" = OrderedDict()
         self._group_history: dict[str, list[str]] = {}  # conv_id -> recent "name: text"
         self._last_reject_notice: dict[str, float] = {}
@@ -158,7 +160,7 @@ class CwsBridge:
         self._participants: "OrderedDict[str, set]" = (
             OrderedDict()
         )  # conv_id -> display names seen
-        self._agent_turns: dict[str, deque[float]] = {}
+        self._agent_turns: "OrderedDict[str, deque[float]]" = OrderedDict()
         self._agent_fingerprints: "OrderedDict[str, float]" = OrderedDict()
         self._agent_loop_admitted: "OrderedDict[str, None]" = OrderedDict()
         self._sync_seq: int = int(
@@ -449,12 +451,13 @@ class CwsBridge:
         if frame.type == FRAME_MESSAGE:
             await self._handle_message_frame(frame)
         elif frame.type == FRAME_SYNC:
-            for ev in frame.payload.get("events") or []:
-                await self._deliver_by_id(
-                    str(ev.get("conversation_id", "")),
-                    ev.get("message_id"),
-                    int(ev.get("seq") or 0),
-                )
+            async with self._sync_lock:
+                for ev in frame.payload.get("events") or []:
+                    await self._deliver_by_id(
+                        str(ev.get("conversation_id", "")),
+                        ev.get("message_id"),
+                        int(ev.get("seq") or 0),
+                    )
         elif frame.type == FRAME_SYSTEM:
             await self._handle_system_frame(frame)
         # typing / read_state / presence / acks: no runtime delivery needed.
@@ -670,10 +673,21 @@ class CwsBridge:
         message_key = f"{msg.conversation_id}:{msg.message_id}"
         if message_key in self._agent_loop_admitted:
             return ""  # delivery retry for the same un-acked message
-        try:
-            hop = int(msg.metadata.get("agent_hop_count") or 1)
-        except (TypeError, ValueError):
-            return "agent_hop_invalid"
+        if "agent_hop_count" not in msg.metadata:
+            hop = 1
+        else:
+            raw_hop = msg.metadata["agent_hop_count"]
+            if isinstance(raw_hop, bool):
+                return "agent_hop_invalid"
+            if isinstance(raw_hop, int):
+                hop = raw_hop
+            elif isinstance(raw_hop, str):
+                try:
+                    hop = int(raw_hop.strip())
+                except (TypeError, ValueError):
+                    return "agent_hop_invalid"
+            else:
+                return "agent_hop_invalid"
         if hop < 1 or hop > self._policy.max_agent_hops:
             return "agent_hop_limit"
 
@@ -693,8 +707,22 @@ class CwsBridge:
             return "agent_duplicate"
 
         turn_key = f"{msg.conversation_id}:{msg.sender_id}"
-        turns = self._agent_turns.setdefault(turn_key, deque())
         cutoff = now - self._policy.agent_turn_window_s
+        while self._agent_turns:
+            oldest_key, oldest_turns = next(iter(self._agent_turns.items()))
+            while oldest_turns and oldest_turns[0] <= cutoff:
+                oldest_turns.popleft()
+            if oldest_turns and len(self._agent_turns) <= _AGENT_TURN_KEYS_MAX:
+                break
+            self._agent_turns.pop(oldest_key, None)
+        turns = self._agent_turns.get(turn_key)
+        if turns is None:
+            while len(self._agent_turns) >= _AGENT_TURN_KEYS_MAX:
+                self._agent_turns.popitem(last=False)
+            turns = deque()
+            self._agent_turns[turn_key] = turns
+        else:
+            self._agent_turns.move_to_end(turn_key)
         while turns and turns[0] <= cutoff:
             turns.popleft()
         if len(turns) >= self._policy.agent_turn_budget:
@@ -729,11 +757,28 @@ class CwsBridge:
         self, conversation_id: str, message_id, seq: int, frame: Optional[Frame] = None
     ) -> None:
         key = f"{conversation_id}:{message_id}"
-        # The in-flight guard closes the WS-frame vs /sync-replay race: both
-        # can observe the same undelivered message concurrently.
-        if key in self._seen or key in self._inflight:
+        if key in self._seen:
+            # Realtime delivery never commits the global cursor. Serialized
+            # /sync later advances through already-seen messages in server order.
+            if frame is None and seq > 0:
+                await self._advance(conversation_id, 0, inbox_seq=seq)
+            return
+        # If /sync catches a realtime attempt still in progress, wait for its
+        # outcome. Success becomes an ordered cursor-only commit; failure is
+        # retried here and stops this serialized sync batch if it fails again.
+        if key in self._inflight:
+            if frame is not None:
+                return
+            done = self._inflight_done[key]
+            await done.wait()
+            if key in self._seen:
+                await self._advance(conversation_id, 0, inbox_seq=seq)
+                return
+            await self._deliver_by_id(conversation_id, message_id, seq)
             return
         self._inflight.add(key)
+        done = asyncio.Event()
+        self._inflight_done[key] = done
         try:
             detail = await self.comm.get_message(conversation_id, message_id)
             # /sync carries the org-level inbox watermark in event.seq.  A
@@ -745,12 +790,14 @@ class CwsBridge:
                 if isinstance(detail.get("message"), dict)
                 else None
             )
-            inbox_seq = int(seq or 0) if frame is None else int(detail_inbox or 0)
+            observed_inbox_seq = int(detail_inbox or 0)
+            inbox_seq = int(seq or 0) if frame is None else 0
+            metadata_inbox_seq = observed_inbox_seq or inbox_seq
             raw_message = detail.get("message") or detail
             conversation_seq = int(raw_message.get("seq") or seq or 0)
-            if inbox_seq > 0:
+            if metadata_inbox_seq > 0:
                 detail = dict(detail)
-                detail["_inbox_seq"] = inbox_seq
+                detail["_inbox_seq"] = metadata_inbox_seq
             msg = self._normalize(detail, conversation_id, seq)
             if msg is None:
                 self._mark_seen(key)
@@ -885,6 +932,8 @@ class CwsBridge:
             )
         finally:
             self._inflight.discard(key)
+            self._inflight_done.pop(key, None)
+            done.set()
 
     # -- received-ack reaction (zylos parity: 👀 on receipt, cleared on reply) --
 
@@ -1147,13 +1196,18 @@ class CwsBridge:
         cached = self._conv_types.get(conversation_id)
         if cached:
             return cached
-        info_out = {"type": "dm", "name": ""}
         try:
             info = await self.comm.get_conversation(conversation_id)
-            info_out["type"] = str(info.get("type", "dm")).lower() or "dm"
-            info_out["name"] = str(info.get("name") or "")
-        except Exception as exc:  # noqa: BLE001 — assume dm on failure
-            self._log.warn("get_conversation failed, assuming dm:", exc)
+        except Exception as exc:  # noqa: BLE001 — unknown type must fail closed
+            self._log.warn("get_conversation failed; delivery remains pending:", exc)
+            raise
+        conversation_type = str(info.get("type") or "").lower()
+        if not conversation_type:
+            raise ValueError("conversation response is missing type")
+        info_out = {
+            "type": conversation_type,
+            "name": str(info.get("name") or ""),
+        }
         self._conv_types[conversation_id] = info_out
         while len(self._conv_types) > 512:
             self._conv_types.popitem(last=False)
