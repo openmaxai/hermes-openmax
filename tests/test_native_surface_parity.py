@@ -342,6 +342,38 @@ def test_access_policy_service_matches_zylos_dm_contract_and_preserves_other_pol
         service.allow_dm_members([])
 
 
+def test_access_policy_service_uses_live_bridge_as_single_writer():
+    storage = MemoryStorage(
+        {"dm_policy": "owner", "dm_allowlist": [], "group_policy": "allowlist"}
+    )
+    live = {"dm_policy": "owner", "dm_allowlist": ["live-user"]}
+    applied = []
+
+    def apply(policy, allowlist):
+        live["dm_policy"] = policy
+        live["dm_allowlist"] = list(allowlist)
+        applied.append((policy, list(allowlist)))
+        return dict(live)
+
+    service = AccessPolicyService(
+        storage,
+        get_live_state=lambda: dict(live),
+        apply_live_state=apply,
+    )
+
+    assert service.get_dm_access() == live
+    assert service.set_dm_policy("allowlist") == {
+        "dm_policy": "allowlist",
+        "dm_allowlist": ["live-user"],
+    }
+    assert service.allow_dm_members(["agent-owner"]) == {
+        "dm_policy": "allowlist",
+        "dm_allowlist": ["live-user", "agent-owner"],
+    }
+    assert applied[-1] == ("allowlist", ["live-user", "agent-owner"])
+    assert storage.value["dm_allowlist"] == []
+
+
 def test_comm_send_local_attachment_closes_upload_finalize_send_without_returning_url(
     tmp_path,
 ):

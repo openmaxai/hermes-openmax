@@ -181,7 +181,7 @@ async def test_config_hot_update_frames(tmp_path):
     await b._handle_frame(
         sysframe(
             "agent.config.group_mode_changed",
-            {"conversation_id": "c-9", "mode": "open"},
+            {"conversation_id": "c-9", "mode": "smart"},
         )
     )
     assert b._effective_policy("c-9").group_require_mention is False

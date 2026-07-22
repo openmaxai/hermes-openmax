@@ -96,13 +96,29 @@ def _run(coro_factory) -> str:
         storage = FileStorage(_STATE_DIR)
         tokens = TokenManager(cfg, storage=storage)
         http = CwsHttpClient(cfg, tokens)
+        from .adapter import CwsAdapter
+
+        instance = CwsAdapter._last_instance
+        live_bridge = (
+            instance._bridge
+            if instance and instance._bridge and instance._bridge._running
+            else None
+        )
         try:
             svc = {
                 "tm": TmService(http),
                 "kb": KbService(http),
                 "core": CoreService(http),
                 "comm": CommService(http),
-                "policy": AccessPolicyService(storage),
+                "policy": AccessPolicyService(
+                    storage,
+                    get_live_state=(live_bridge.get_dm_access if live_bridge else None),
+                    apply_live_state=(
+                        live_bridge.apply_local_dm_access_threadsafe
+                        if live_bridge
+                        else None
+                    ),
+                ),
             }
             return await coro_factory(svc)
         finally:

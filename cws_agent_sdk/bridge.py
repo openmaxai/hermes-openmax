@@ -15,10 +15,12 @@ raising. A failed delivery keeps the seq un-acked so /sync replays it.
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+import hashlib
+import time
+from collections import OrderedDict, deque
 from typing import Awaitable, Callable, Optional
 
-from .access_policy import AccessPolicyConfig, decide_inbound
+from .access_policy import AccessPolicyConfig, _is_mentioned, decide_inbound
 from .codec import FRAME_MESSAGE, FRAME_SYNC, FRAME_SYSTEM, Frame, encode_typing
 from .config import CwsConfig
 from .errors import CwsApiError
@@ -54,6 +56,16 @@ _GROUP_CONTEXT_N = 5
 DM_REJECT_NOTICE = (
     "你好,我暂时无法处理这条私信(访问策略限制)。请联系我的 owner 开通权限。"
 )
+GROUP_REJECT_NOTICES = {
+    "group_disabled": "Sorry, group chat is currently disabled.",
+    "group_not_allowlisted": "Sorry, this group is not enabled for this agent.",
+    "group_sender_not_allowed": "Sorry, you are not allowed to trigger this agent in this group.",
+}
+
+_VALID_DM_POLICIES = {"open", "allowlist", "owner"}
+_VALID_GROUP_POLICIES = {"open", "allowlist", "disabled"}
+_VALID_GROUP_MODES = {"mention", "smart", "silent"}
+_VALID_LIST_ACTIONS = {"add", "remove", "set"}
 
 SMART_MODE_HINT = (
     "<smart-mode>You were not mentioned. Decide whether to respond. Do NOT "
@@ -146,17 +158,22 @@ class CwsBridge:
         self._participants: "OrderedDict[str, set]" = (
             OrderedDict()
         )  # conv_id -> display names seen
+        self._agent_turns: dict[str, deque[float]] = {}
+        self._agent_fingerprints: "OrderedDict[str, float]" = OrderedDict()
+        self._agent_loop_admitted: "OrderedDict[str, None]" = OrderedDict()
         self._sync_seq: int = int(
             (storage.read_json(_SYNC_SEQ_KEY) or {}).get("seq", 0)
         )
         self._sync_lock = asyncio.Lock()
         self._owner_sync_lock = asyncio.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._running = False
 
     # -- lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
         # Fail fast on bad credentials before going async.
+        self._loop = asyncio.get_running_loop()
         await self._tokens.get_access_token()
         await self._resolve_identity()
         self._running = True
@@ -192,6 +209,7 @@ class CwsBridge:
         await self._ws.stop()
         await self._http.aclose()
         await self._tokens.aclose()
+        self._loop = None
 
     async def _resolve_identity(self) -> None:
         """Fill member_id from /me when unset; pull authoritative owner."""
@@ -319,6 +337,17 @@ class CwsBridge:
 
     # -- outbound ------------------------------------------------------------
 
+    def _outbound_agent_metadata(self, metadata: Optional[dict], cmid: str) -> dict:
+        result = dict(metadata or {})
+        try:
+            prior_hop = int(result.get("agent_hop_count") or 0)
+        except (TypeError, ValueError):
+            prior_hop = 0
+        result["agent_hop_count"] = prior_hop + 1
+        result.setdefault("agent_origin_member_id", self._cfg.member_id)
+        result.setdefault("agent_trace_id", cmid)
+        return result
+
     async def send(
         self,
         conversation_id: str,
@@ -331,11 +360,12 @@ class CwsBridge:
 
         cmid = new_client_msg_id()
         self._remember_own(cmid)
+        outbound_metadata = self._outbound_agent_metadata(metadata, cmid)
         receipt = await self.comm.send_message(
             conversation_id,
             self._canonicalize_mentions(conversation_id, content),
             reply_to=reply_to,
-            metadata=metadata,
+            metadata=outbound_metadata,
             client_msg_id=cmid,
         )
         # Replying resolves the pending received-ack (zylos parity) and any
@@ -354,6 +384,7 @@ class CwsBridge:
         *,
         caption: str = "",
         reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ) -> SendReceipt:
         """Upload a local image (presigned two-phase) and send it as a native
         IMAGE message with a proper attachment."""
@@ -378,6 +409,10 @@ class CwsBridge:
                     )
                     resp.raise_for_status()
         fin = await self.artifacts.finalize_conversation_upload(prep["upload_token"])
+        from .codec import new_client_msg_id
+
+        cmid = new_client_msg_id()
+        self._remember_own(cmid)
         receipt = await self.comm.send_image_message(
             conversation_id,
             artifact_id=str(fin.get("artifact_id", "")),
@@ -386,6 +421,8 @@ class CwsBridge:
             size_bytes=size,
             caption=caption,
             reply_to=reply_to,
+            client_msg_id=cmid,
+            metadata=self._outbound_agent_metadata(metadata, cmid),
         )
         await self._clear_ack(conversation_id)
         return receipt
@@ -441,7 +478,11 @@ class CwsBridge:
         self._log.log("config event:", event)
         if event == "agent.config.dm_allowlist_changed":
             action = str(data.get("action", "")).lower()
-            ids = [str(i) for i in data.get("member_ids") or []]
+            raw_ids = data.get("member_ids")
+            if action not in _VALID_LIST_ACTIONS or not isinstance(raw_ids, list):
+                self._log.warn("invalid dm allowlist event:", action)
+                return
+            ids = [str(i) for i in raw_ids if str(i)]
             if action == "add":
                 for i in ids:
                     if i not in self._policy.dm_allowlist:
@@ -450,49 +491,62 @@ class CwsBridge:
                 self._policy.dm_allowlist = [
                     i for i in self._policy.dm_allowlist if i not in ids
                 ]
-            elif action == "set":
+            else:  # set
                 self._policy.dm_allowlist = ids
             self._save_policy_state()
         elif event == "agent.config.dm_policy_changed":
             policy = str(data.get("policy", "")).lower()
-            if policy in ("open", "allowlist", "owner"):
-                self._policy.dm_policy = policy
-                self._save_policy_state()
+            if policy not in _VALID_DM_POLICIES:
+                self._log.warn("invalid dm policy event:", policy)
+                return
+            self._policy.dm_policy = policy
+            self._save_policy_state()
         elif event == "agent.config.group_mode_changed":
             conv = str(data.get("conversation_id", ""))
-            if conv:
-                mode = str(data.get("mode", ""))
-                self._group_mode_overrides[conv] = mode
-                if mode == "silent":
-                    self._policy.group_configs.pop(conv, None)
-                else:
-                    group = self._policy.group_configs.setdefault(
-                        conv, {"mode": "mention", "allow_from": ["*"]}
-                    )
-                    group["mode"] = mode
-                self._save_policy_state()
+            mode = str(data.get("mode", "")).lower()
+            if not conv or mode not in _VALID_GROUP_MODES:
+                self._log.warn("invalid group mode event:", conv, mode)
+                return
+            self._group_mode_overrides[conv] = mode
+            group = self._policy.group_configs.setdefault(
+                conv, {"mode": "mention", "allow_from": ["*"]}
+            )
+            group["mode"] = mode
+            self._save_policy_state()
         elif event == "agent.config.group_scope_changed":
             scope = str(data.get("scope", "")).lower()
-            if scope in ("open", "allowlist", "disabled"):
-                self._policy.group_policy = scope
-                self._save_policy_state()
+            if scope not in _VALID_GROUP_POLICIES:
+                self._log.warn("invalid group scope event:", scope)
+                return
+            self._policy.group_policy = scope
+            self._save_policy_state()
         elif event == "agent.config.group_allowlist_changed":
+            action = str(data.get("action", "")).lower()
+            raw_ids = data.get("conversation_ids")
+            if action not in _VALID_LIST_ACTIONS or not isinstance(raw_ids, list):
+                self._log.warn("invalid group allowlist event:", action)
+                return
             self._update_group_allowlist(
-                str(data.get("action", "")).lower(),
-                [str(v) for v in data.get("conversation_ids") or []],
+                action,
+                [str(v) for v in raw_ids if str(v)],
             )
         elif event == "agent.config.group_allowfrom_changed":
             conv = str(data.get("conversation_id") or "")
-            if conv and isinstance(data.get("allow_from"), list):
-                group = self._policy.group_configs.setdefault(
-                    conv, {"mode": "mention", "allow_from": ["*"]}
-                )
-                group["allow_from"] = [str(v) for v in data["allow_from"]]
-                self._save_policy_state()
+            raw_allow = data.get("allow_from")
+            if not conv or not isinstance(raw_allow, list):
+                self._log.warn("invalid group allowFrom event:", conv)
+                return
+            group = self._policy.group_configs.setdefault(
+                conv, {"mode": "mention", "allow_from": ["*"]}
+            )
+            group["allow_from"] = [str(v) for v in raw_allow if str(v)]
+            self._save_policy_state()
         elif event == "agent.config.owner_changed":
             # The pushed owner is only a refresh hint. Core's authenticated
             # member record remains authoritative.
             await self._sync_owner_from_core(notify=True)
+            return
+        else:
             return
         # Other events (dm_policy / group_scope / group_allowlist / allowfrom)
         # are forwarded to the adapter callback; interpretation is host policy.
@@ -586,11 +640,16 @@ class CwsBridge:
         elif action == "remove":
             for conv in conversation_ids:
                 groups.pop(conv, None)
+                self._group_mode_overrides.pop(conv, None)
         elif action == "set":
             old = dict(groups)
+            old_modes = dict(self._group_mode_overrides)
             groups.clear()
+            self._group_mode_overrides.clear()
             for conv in conversation_ids:
                 groups[conv] = old.get(conv, {"mode": "mention", "allow_from": ["*"]})
+                if conv in old_modes:
+                    self._group_mode_overrides[conv] = old_modes[conv]
         else:
             return
         self._save_policy_state()
@@ -603,6 +662,56 @@ class CwsBridge:
             return str(member.get("owner_member_id") or "")
         except Exception:  # noqa: BLE001
             return ""
+
+    def _agent_loop_rejection(self, msg: InboundMessage) -> str:
+        """Local fail-closed circuit breakers after Agent policy admission."""
+        if msg.sender_type != "agent":
+            return ""
+        message_key = f"{msg.conversation_id}:{msg.message_id}"
+        if message_key in self._agent_loop_admitted:
+            return ""  # delivery retry for the same un-acked message
+        try:
+            hop = int(msg.metadata.get("agent_hop_count") or 1)
+        except (TypeError, ValueError):
+            return "agent_hop_invalid"
+        if hop < 1 or hop > self._policy.max_agent_hops:
+            return "agent_hop_limit"
+
+        now = time.monotonic()
+        fingerprint_input = "\0".join(
+            (
+                msg.conversation_id,
+                msg.sender_id,
+                msg.reply_to_message_id or "",
+                " ".join((msg.text or "").split()).casefold(),
+            )
+        )
+        fingerprint = hashlib.sha256(fingerprint_input.encode("utf-8")).hexdigest()
+        duplicate_window = self._policy.agent_duplicate_window_s
+        previous = self._agent_fingerprints.get(fingerprint)
+        if previous is not None and now - previous < duplicate_window:
+            return "agent_duplicate"
+
+        turn_key = f"{msg.conversation_id}:{msg.sender_id}"
+        turns = self._agent_turns.setdefault(turn_key, deque())
+        cutoff = now - self._policy.agent_turn_window_s
+        while turns and turns[0] <= cutoff:
+            turns.popleft()
+        if len(turns) >= self._policy.agent_turn_budget:
+            return "agent_turn_budget"
+
+        turns.append(now)
+        self._agent_fingerprints[fingerprint] = now
+        self._agent_fingerprints.move_to_end(fingerprint)
+        while self._agent_fingerprints:
+            _, oldest = next(iter(self._agent_fingerprints.items()))
+            if len(self._agent_fingerprints) <= 2048 and now - oldest < duplicate_window:
+                break
+            self._agent_fingerprints.popitem(last=False)
+        self._agent_loop_admitted[message_key] = None
+        while len(self._agent_loop_admitted) > _DEDUP_MAX:
+            self._agent_loop_admitted.popitem(last=False)
+        return ""
 
     async def _handle_message_frame(self, frame: Frame) -> None:
         p = frame.payload
@@ -637,28 +746,28 @@ class CwsBridge:
                 else None
             )
             inbox_seq = int(seq or 0) if frame is None else int(detail_inbox or 0)
+            raw_message = detail.get("message") or detail
+            conversation_seq = int(raw_message.get("seq") or seq or 0)
             if inbox_seq > 0:
                 detail = dict(detail)
                 detail["_inbox_seq"] = inbox_seq
             msg = self._normalize(detail, conversation_id, seq)
             if msg is None:
                 self._mark_seen(key)
-                await self._advance(conversation_id, seq, inbox_seq=seq)
+                await self._advance(
+                    conversation_id, conversation_seq, inbox_seq=inbox_seq
+                )
                 return
             conv_info = await self._conversation_info(conversation_id)
             msg.conversation_type = conv_info["type"]
             if conv_info.get("name"):
                 msg.metadata["conversation_name"] = conv_info["name"]
-            if not msg.sender_name and msg.sender_id:
-                msg.sender_name = await self._member_name(msg.sender_id)
-            if msg.sender_name:
-                self._record_participant(conversation_id, msg.sender_name)
             is_group = msg.conversation_type not in ("dm",)
-            if is_group:
-                # zylos group-history parity: record EVERY group message
-                # (handled or not) so later turns get conversation context.
-                self._record_group_history(conversation_id, msg)
-            mode = self._group_mode_overrides.get(conversation_id, "").lower()
+            effective_policy = self._effective_policy(conversation_id)
+            group_cfg = effective_policy.group_configs.get(conversation_id) or {}
+            mode = str(group_cfg.get("mode") or "").lower()
+            if not msg.sender_name and msg.sender_id and mode != "silent":
+                msg.sender_name = await self._member_name(msg.sender_id)
             # zylos parity: dm_policy=owner with no owner bound — the first
             # human DM sender becomes the owner (persisted; platform data
             # overrides on next identity resolve if it disagrees).
@@ -672,20 +781,68 @@ class CwsBridge:
                 self.owner_member_id = msg.sender_id
                 self._save_policy_state()
                 self._log.log("owner auto-bound to first DM sender:", msg.sender_id)
-            await self._hydrate_media(msg)
-            await self._expand_work_references(msg)
-            await self._hydrate_reply_context(msg)
             decision = decide_inbound(
                 msg,
                 self_member_id=self._cfg.member_id,
-                cfg=self._effective_policy(conversation_id),
+                cfg=effective_policy,
                 owner_member_id=self.owner_member_id,
-                sender_owner_member_id=await self._sender_owner(msg),
+                sender_owner_member_id=(
+                    await self._sender_owner(msg) if not is_group else ""
+                ),
             )
-            if decision.handle and is_group and (
-                mode == "silent" or decision.reason == "group_silent"
-            ):
-                msg.metadata["group_silent"] = True
+            if decision.handle:
+                loop_rejection = self._agent_loop_rejection(msg)
+                if loop_rejection:
+                    self._log.log(
+                        f"policy skip [{loop_rejection}] conv={conversation_id} msg={message_id}"
+                    )
+                    self._mark_seen(key)
+                    await self._advance(
+                        conversation_id,
+                        msg.seq or conversation_seq,
+                        inbox_seq=inbox_seq,
+                    )
+                    return
+            context_eligible = decision.handle or decision.reason in (
+                "group_no_mention",
+                "group_silent",
+            )
+            if msg.sender_name and (not is_group or context_eligible):
+                self._record_participant(conversation_id, msg.sender_name)
+            if is_group and context_eligible:
+                # Allowed background traffic is cached in a small bridge-owned
+                # history window. Rejected groups/senders never enter context.
+                self._record_group_history(conversation_id, msg)
+            if not decision.handle:
+                self._log.log(
+                    f"policy skip [{decision.reason}] conv={conversation_id} msg={message_id}"
+                )
+                await self._maybe_send_reject_notice(
+                    conversation_id,
+                    msg,
+                    decision.reason,
+                    is_sync_replay=frame is None,
+                )
+                self._mark_seen(key)
+                await self._advance(
+                    conversation_id,
+                    msg.seq or conversation_seq,
+                    inbox_seq=inbox_seq,
+                )
+                return
+            if is_group and (mode == "silent" or decision.reason == "group_silent"):
+                # Observe at the bridge only: no attachment/work hydration,
+                # billing lookup, ack reaction, Hermes session, or model turn.
+                self._mark_seen(key)
+                await self._advance(
+                    conversation_id,
+                    msg.seq or conversation_seq,
+                    inbox_seq=inbox_seq,
+                )
+                return
+            await self._hydrate_media(msg)
+            await self._expand_work_references(msg)
+            await self._hydrate_reply_context(msg)
             if decision.handle and is_group:
                 history = self._group_history.get(conversation_id, [])
                 recent = [h for h in history[:-1]][-_GROUP_CONTEXT_N:]
@@ -693,9 +850,11 @@ class CwsBridge:
                     msg.metadata["group_context"] = (
                         "<group-context>\n" + "\n".join(recent) + "\n</group-context>"
                     )
-                from .access_policy import _is_mentioned
-
-                if mode == "smart" and not _is_mentioned(msg, self._cfg.member_id):
+                if mode == "smart" and not _is_mentioned(
+                    msg,
+                    self._cfg.member_id,
+                    (self._policy.self_display_name, *self._policy.self_aliases),
+                ):
                     msg.metadata["smart_mode_hint"] = SMART_MODE_HINT
             if (
                 decision.handle
@@ -709,23 +868,21 @@ class CwsBridge:
                     except CwsApiError as exc:
                         self._log.warn("overdue notice failed:", exc)
                 self._mark_seen(key)
-                await self._advance(conversation_id, msg.seq or seq, inbox_seq=seq)
-                return
-            if not decision.handle:
-                self._log.log(
-                    f"policy skip [{decision.reason}] conv={conversation_id} msg={message_id}"
+                await self._advance(
+                    conversation_id,
+                    msg.seq or conversation_seq,
+                    inbox_seq=inbox_seq,
                 )
-                await self._maybe_send_reject_notice(
-                    conversation_id, msg, decision.reason
-                )
-                self._mark_seen(key)
-                await self._advance(conversation_id, msg.seq or seq, inbox_seq=seq)
                 return
             await self._ack_received(conversation_id, str(message_id))
             # Delivery point — exceptions propagate, watermark stays put, /sync replays.
             await self._on_message(msg)
             self._mark_seen(key)
-            await self._advance(conversation_id, msg.seq or seq, inbox_seq=seq)
+            await self._advance(
+                conversation_id,
+                msg.seq or conversation_seq,
+                inbox_seq=inbox_seq,
+            )
         finally:
             self._inflight.discard(key)
 
@@ -968,13 +1125,11 @@ class CwsBridge:
         from dataclasses import replace
 
         low = mode.lower()
-        if "smart" in low:
+        if low == "smart":
             # smart: receive everything, model decides ([SKIP] to stay silent).
             return replace(self._policy, group_require_mention=False)
-        if "mention" in low:
+        if low == "mention":
             return replace(self._policy, group_require_mention=True)
-        if low in ("open", "all") or "open" in low:
-            return replace(self._policy, group_require_mention=False)
         if low == "silent":
             from copy import deepcopy
 
@@ -1108,22 +1263,36 @@ class CwsBridge:
         del hist[:-_GROUP_HISTORY_LEN]
 
     async def _maybe_send_reject_notice(
-        self, conversation_id: str, msg: InboundMessage, reason: str
+        self,
+        conversation_id: str,
+        msg: InboundMessage,
+        reason: str,
+        *,
+        is_sync_replay: bool = False,
     ) -> None:
-        """zylos parity: polite rejection for human DMs blocked by policy —
-        throttled, never for agents/system, never for group-no-mention."""
-        if reason not in ("dm_owner_only", "dm_not_allowlisted"):
+        """Send a throttled notice only for a live, actionable human rejection."""
+        if msg.sender_type != "human" or is_sync_replay:
             return
-        if msg.sender_type != "human":
+        notice = ""
+        if reason in ("dm_owner_only", "dm_not_allowlisted"):
+            notice = DM_REJECT_NOTICE
+        elif reason in GROUP_REJECT_NOTICES and _is_mentioned(
+            msg,
+            self._cfg.member_id,
+            (self._policy.self_display_name, *self._policy.self_aliases),
+        ):
+            notice = GROUP_REJECT_NOTICES[reason]
+        if not notice:
             return
         import time as _time
 
         now = _time.time()
-        if now - self._last_reject_notice.get(conversation_id, 0) < 3600:
+        throttle_key = f"{conversation_id}:{reason}"
+        if now - self._last_reject_notice.get(throttle_key, 0) < 3600:
             return
-        self._last_reject_notice[conversation_id] = now
+        self._last_reject_notice[throttle_key] = now
         try:
-            await self.comm.send_message(conversation_id, DM_REJECT_NOTICE)
+            await self.comm.send_message(conversation_id, notice)
         except Exception as exc:  # noqa: BLE001 — notice is best-effort
             self._log.warn("reject notice failed:", exc)
 
@@ -1133,20 +1302,86 @@ class CwsBridge:
         saved = self._storage.read_json(_POLICY_KEY)
         if not isinstance(saved, dict):
             return
-        if saved.get("dm_policy"):
-            self._policy.dm_policy = str(saved["dm_policy"])
+        dm_policy = str(saved.get("dm_policy") or "").lower()
+        if dm_policy in _VALID_DM_POLICIES:
+            self._policy.dm_policy = dm_policy
         if saved.get("owner_member_id"):
             self.owner_member_id = str(saved["owner_member_id"])
         if isinstance(saved.get("dm_allowlist"), list):
-            self._policy.dm_allowlist = [str(i) for i in saved["dm_allowlist"]]
-        if isinstance(saved.get("group_modes"), dict):
-            self._group_mode_overrides.update(
-                {str(k): str(v) for k, v in saved["group_modes"].items()}
-            )
-        if saved.get("group_policy"):
-            self._policy.group_policy = str(saved["group_policy"])
+            self._policy.dm_allowlist = [
+                str(i) for i in saved["dm_allowlist"] if str(i)
+            ]
+        group_policy = str(saved.get("group_policy") or "").lower()
+        if group_policy in _VALID_GROUP_POLICIES:
+            self._policy.group_policy = group_policy
+        groups: dict[str, dict] = {}
         if isinstance(saved.get("group_configs"), dict):
-            self._policy.group_configs = dict(saved["group_configs"])
+            for raw_conv, raw_config in saved["group_configs"].items():
+                conv = str(raw_conv)
+                if not conv or not isinstance(raw_config, dict):
+                    continue
+                mode = str(raw_config.get("mode") or "mention").lower()
+                if mode not in _VALID_GROUP_MODES:
+                    mode = "mention"
+                raw_allow = (
+                    raw_config.get("allow_from")
+                    if "allow_from" in raw_config
+                    else raw_config.get("allowFrom")
+                )
+                allow_from = (
+                    [str(v) for v in raw_allow if str(v)]
+                    if isinstance(raw_allow, list)
+                    else ["*"]
+                )
+                groups[conv] = {"mode": mode, "allow_from": allow_from}
+        self._policy.group_configs = groups
+        if isinstance(saved.get("group_modes"), dict):
+            for raw_conv, raw_mode in saved["group_modes"].items():
+                conv, mode = str(raw_conv), str(raw_mode).lower()
+                if not conv or mode not in _VALID_GROUP_MODES:
+                    continue
+                self._group_mode_overrides[conv] = mode
+                group = self._policy.group_configs.setdefault(
+                    conv, {"mode": "mention", "allow_from": ["*"]}
+                )
+                group["mode"] = mode
+
+    def get_dm_access(self) -> dict:
+        return {
+            "dm_policy": self._policy.dm_policy,
+            "dm_allowlist": list(self._policy.dm_allowlist),
+        }
+
+    async def apply_local_dm_access(
+        self, dm_policy: str, dm_allowlist: list[str]
+    ) -> dict:
+        policy = str(dm_policy or "").lower()
+        if policy not in _VALID_DM_POLICIES:
+            raise ValueError("policy must be one of: open, allowlist, owner")
+        self._policy.dm_policy = policy
+        self._policy.dm_allowlist = list(
+            dict.fromkeys(str(v) for v in dm_allowlist if str(v))
+        )
+        self._save_policy_state()
+        self._spawn_bg(self._report_policy(), "cws-local-policy-report")
+        return self.get_dm_access()
+
+    def apply_local_dm_access_threadsafe(
+        self, dm_policy: str, dm_allowlist: list[str]
+    ) -> dict:
+        loop = self._loop
+        if not loop or not loop.is_running():
+            raise RuntimeError("CWS bridge event loop is not running")
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is loop:
+            raise RuntimeError("cannot block the CWS bridge event loop")
+        future = asyncio.run_coroutine_threadsafe(
+            self.apply_local_dm_access(dm_policy, dm_allowlist), loop
+        )
+        return future.result(timeout=10)
 
     def _save_policy_state(self) -> None:
         self._storage.write_json(
